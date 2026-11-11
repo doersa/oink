@@ -139,6 +139,8 @@ pub enum ControlMsg {
         controllable: bool,
         /// Gesture-only physical contacts supported by the live injector.
         touchpad_contacts: Option<u8>,
+        /// This endpoint can execute the additive Notification Center gesture semantic.
+        notification_center_actions: bool,
     },
     /// Explicit action; never forwarded to a new focus or converted to keys.
     LockRemoteWindows(WindowsLockRequest),

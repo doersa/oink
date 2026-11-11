@@ -864,7 +864,8 @@ fn capability_change_does_not_rotate_routing_instance_or_close_inbound() {
         h.driver.adapter.opening_state(false)[0],
         Message::Control(ControlMsg::InputCapability {
             controllable: false,
-            touchpad_contacts: None
+            touchpad_contacts: None,
+            ..
         })
     ));
     h.driver.command(InputCommand::Controllable(true));
@@ -2085,6 +2086,95 @@ fn queued_writer_uses_current_native_permission_and_not_its_old_snapshot() {
         drain(&mut read)[0],
         Message::Control(ControlMsg::InputCapability { controllable: true, .. })
     ));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn inbound_input_stream_refreshes_cached_notification_center_state_before_routing() {
+    use oink_foundation::input::{
+        Gesture, GesturePhase, NotificationCenterNativeFields, NotificationCenterPanelState, SourceKind,
+    };
+
+    let backend = Arc::new(oink_test_support::input::FakeInput::new());
+    backend.set_notification_center_panel_state(NotificationCenterPanelState::Open);
+    let mut h = Harness::with_backend(backend.clone());
+    let (_read, _) = h.outbound(1);
+    let (write, input) = reliable_pair(LinkId(1), tag(1), QueueSpec::reliable(StreamKind::Input).1);
+    h.driver.command(InputCommand::Inbound {
+        peer: peer(),
+        input,
+        motion: None,
+        peer_os: Os::MacOS,
+    });
+    let remote = Adapter::new(Router::new(
+        RouterConfig::new(fixture_boot(peer()), "remote", Os::MacOS),
+        Arc::new(SimpleLayout::new()),
+    ));
+    opening(&write, &remote, true);
+    h.attach();
+    assert_eq!(h.driver.adapter.router().config().os, Os::MacOS);
+    h.driver.message(
+        peer(),
+        Message::Control(ControlMsg::FocusEnter {
+            epoch: 2,
+            display: "screen".into(),
+            pos: oink_foundation::Point::new(5., 5.),
+            scope: Some(input_scope(&h.driver)),
+            pointer_source: Some(peer()),
+        }),
+    );
+    assert_eq!(h.driver.adapter.focus().holder, h.driver.local);
+
+    let phases = [GesturePhase::Began, GesturePhase::Changed, GesturePhase::Ended];
+    let mut expected = Vec::new();
+    for phase in phases {
+        let swipe_phase = match phase {
+            GesturePhase::Began => 1,
+            GesturePhase::Changed => 2,
+            GesturePhase::Ended => 4,
+            GesturePhase::Cancelled => 8,
+        };
+        let gesture = Gesture::NotificationCenter {
+            phase,
+            native: Some(NotificationCenterNativeFields {
+                motion: 1,
+                flavor: 1,
+                swipe_phase,
+                progress: 0.25,
+                progress_f32_bits: i64::from(0.25_f32.to_bits()),
+                gesture_progress: 0.5,
+                inverted_from_device: 0,
+                raw_field_129: 0.0,
+                raw_field_130: 0.0,
+            }),
+        };
+        write
+            .post(
+                encode(&Message::Input(InputMsg::Gesture {
+                    source: SourceKind::Touchpad,
+                    gesture,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        expected.push(gesture);
+    }
+
+    let until = Instant::now() + Duration::from_secs(2);
+    let mut actual = Vec::new();
+    while Instant::now() < until && actual != expected {
+        h.poll();
+        actual.extend(backend.take_injected().into_iter().filter_map(|event| match event {
+            InjectEvent::Gesture(
+                gesture @ Gesture::NotificationCenter {
+                    native: Some(fields), ..
+                },
+            ) if fields.motion == 1 => Some(gesture),
+            _ => None,
+        }));
+        std::thread::yield_now();
+    }
+    assert_eq!(actual, expected);
 }
 
 #[test]

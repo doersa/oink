@@ -374,6 +374,7 @@ pub(crate) use hot_map;
 #[derive(Clone, Copy, Debug)]
 pub enum Value<'a> {
     Uint(u64),
+    Int(i64),
     Bool(bool),
     F64(f64),
     F32(f32),
@@ -392,6 +393,9 @@ fn write_value(value: Value<'_>, e: &mut Encoder<&mut [u8]>, depth: usize) -> Re
     match value {
         Value::Uint(n) => {
             e.u64(n).map_err(err)?;
+        }
+        Value::Int(n) => {
+            e.int(minicbor::data::Int::from(n)).map_err(err)?;
         }
         Value::Bool(n) => {
             e.bool(n).map_err(err)?;

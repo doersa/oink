@@ -19,12 +19,17 @@
 //!   截获按 136 归一化，重放固定使用 136=1 并转换进度与结束速度。
 //! - 捏合、旋转、智能缩放：类型 29（`kCGSEventGesture`），HID 类型 8（缩放，113 = 放大量）、5（旋转，
 //!   114 = 角度）、22（智能缩放）。
+//! - 通知中心候选：类型 31（Apple WebKit SPI 命名为 `kCGSEventFluidTouchGesture`）、HID 类型 27；CG 字段
+//!   123 / 138 分别命名为 swipe motion / gesture flavor。识别 motion=1（已观察到的关闭路径）与 motion=9，
+//!   flavor=1/2；两个候选 motion 都只在字段和 phase 通过校验后原样重放。Motion=1 关闭字段由本机捕获样本验证。
+//!   有效 phase、progress、progress bits、gesture progress、inverted 标志及原始字段 129/130 都按候选值透传；
+//!   字段 129/130 在 type 31 中的意义仍未确认，不从它们推断方向。其他 motion/flavor 不会被转换为此动作。
 //!
 //! 合成的事件都带本项目的注入标记（`kCGEventSourceUserData` = `MAGIC`），截获回调据此跳过。
 
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType};
-use oink_foundation::input::{Gesture, GesturePhase, SwipeAxis};
+use oink_foundation::input::{Gesture, GesturePhase, NotificationCenterNativeFields, SwipeAxis};
 
 use super::inject::MAGIC;
 use super::keymap::{AuxKey, NX_SUBTYPE_AUX_CONTROL_BUTTONS};
@@ -35,6 +40,8 @@ pub(crate) const TYPE_SYSDEFINED: u32 = 14;
 pub(crate) const TYPE_GESTURE: u32 = 29;
 /// CGEvent 类型：Dock 控制（`kCGSEventDockControl`）。
 pub(crate) const TYPE_DOCK_CONTROL: u32 = 30;
+/// CGEvent type 31, named `kCGSEventFluidTouchGesture` in Apple's WebKit test SPI.
+pub(crate) const TYPE_FLUID_TOUCH_GESTURE: u32 = 31;
 
 /// 私有字段号（见模块说明）。
 mod field {
@@ -53,6 +60,8 @@ mod field {
     pub const SWIPE_PHASE: u32 = 134;
     pub const SWIPE_PROGRESS_F32: u32 = 135;
     pub const SWIPE_INVERTED_FROM_DEVICE: u32 = 136;
+    pub const GESTURE_FLAVOR: u32 = 138;
+    pub const GESTURE_PROGRESS: u32 = 142;
     pub const SWIPE_MOTION_2: u32 = 165;
 }
 
@@ -62,6 +71,24 @@ mod hid_type {
     pub const ZOOM: i64 = 8;
     pub const ZOOM_TOGGLE: i64 = 22;
     pub const DOCK_SWIPE: i64 = 23;
+    pub const FLUID_TOUCH_GESTURE: i64 = 27;
+}
+
+/// Candidate CG field 123 value corresponding to Apple's IOHID FromRightEdge enum.
+mod gesture_motion {
+    pub const CANDIDATE_ALTERNATE: i64 = 1;
+    pub const FROM_RIGHT_EDGE: i64 = 9;
+}
+
+fn notification_center_motion(motion: i64) -> bool {
+    // Keep the input surface limited to the two observed candidates.
+    motion == gesture_motion::CANDIDATE_ALTERNATE || motion == gesture_motion::FROM_RIGHT_EDGE
+}
+
+/// Candidate CG field 138 values corresponding to Apple's IOHID NotificationCenter flavors.
+mod gesture_flavor {
+    pub const NOTIFICATION_CENTER_PRIMARY: i64 = 1;
+    pub const NOTIFICATION_CENTER_SECONDARY: i64 = 2;
 }
 
 /// `IOHIDEventPhaseBits`。
@@ -114,6 +141,30 @@ pub(crate) fn post_aux_key_with_flags(key: AuxKey, modifiers: u64) -> bool {
     };
     CGEvent::set_flags(Some(&ev), CGEventFlags(CGEvent::flags(Some(&ev)).0 | modifiers));
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
+    true
+}
+
+/// Submit the balanced Fn-N shortcut used by macOS to toggle Notification Center.
+/// Both events are allocated before posting, so allocation failure cannot leave a key held.
+/// Retained for phase-only compatibility delivery and local wake/replay actions.
+fn notification_center_key_events() -> Option<[CFRetained<CGEvent>; 2]> {
+    let key = super::keymap::hid_to_mac(oink_foundation::input::KeyCode::keyboard(0x11))?;
+    let make = |pressed| {
+        let event = CGEvent::new_keyboard_event(None, key, pressed)?;
+        CGEvent::set_flags(Some(&event), CGEventFlags::MaskSecondaryFn);
+        CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, MAGIC);
+        Some(event)
+    };
+    Some([make(true)?, make(false)?])
+}
+
+pub(crate) fn post_notification_center_shortcut() -> bool {
+    let Some(events) = notification_center_key_events() else {
+        return false;
+    };
+    for event in &events {
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+    }
     true
 }
 
@@ -186,6 +237,30 @@ pub(crate) fn parse_gesture(ty: u32, int: impl Fn(u32) -> i64, dbl: impl Fn(u32)
                 phase,
                 progress: dbl(field::SWIPE_PROGRESS) * direction,
                 velocity: velocity * direction,
+            })
+        }
+        (TYPE_FLUID_TOUCH_GESTURE, hid_type::FLUID_TOUCH_GESTURE)
+            if notification_center_motion(int(field::SWIPE_MOTION))
+                && matches!(
+                    int(field::GESTURE_FLAVOR),
+                    gesture_flavor::NOTIFICATION_CENTER_PRIMARY | gesture_flavor::NOTIFICATION_CENTER_SECONDARY
+                ) =>
+        {
+            let phase = phase_from_bits(int(field::PHASE))?;
+            let native = NotificationCenterNativeFields {
+                motion: int(field::SWIPE_MOTION),
+                flavor: int(field::GESTURE_FLAVOR),
+                swipe_phase: int(field::SWIPE_PHASE),
+                progress: dbl(field::SWIPE_PROGRESS),
+                progress_f32_bits: int(field::SWIPE_PROGRESS_F32),
+                gesture_progress: dbl(field::GESTURE_PROGRESS),
+                inverted_from_device: int(field::SWIPE_INVERTED_FROM_DEVICE),
+                raw_field_129: dbl(field::SWIPE_EXIT_VX),
+                raw_field_130: dbl(field::SWIPE_EXIT_VY),
+            };
+            Some(Gesture::NotificationCenter {
+                phase,
+                native: native.is_valid_for_phase(phase).then_some(native),
             })
         }
         (TYPE_GESTURE, hid_type::ZOOM) => Some(Gesture::Magnify {
@@ -285,13 +360,53 @@ pub(crate) fn synth_gesture(g: &Gesture) -> Vec<Synth> {
                 i(field::HID_TYPE, hid_type::ZOOM_TOGGLE),
             ],
         }],
+        Gesture::NotificationCenter { phase, native } => native
+            .filter(|fields| fields.is_valid_for_phase(phase))
+            .map(|fields| {
+                vec![Synth {
+                    ty: TYPE_FLUID_TOUCH_GESTURE,
+                    fields: vec![
+                        i(field::EVENT_TYPE, i64::from(TYPE_FLUID_TOUCH_GESTURE)),
+                        i(field::HID_TYPE, hid_type::FLUID_TOUCH_GESTURE),
+                        i(field::SWIPE_MOTION, fields.motion),
+                        i(field::GESTURE_FLAVOR, fields.flavor),
+                        i(field::PHASE, phase_to_bits(phase)),
+                        i(field::SWIPE_PHASE, fields.swipe_phase),
+                        d(field::SWIPE_PROGRESS, fields.progress),
+                        i(field::SWIPE_PROGRESS_F32, fields.progress_f32_bits),
+                        i(field::SWIPE_INVERTED_FROM_DEVICE, fields.inverted_from_device),
+                        d(field::GESTURE_PROGRESS, fields.gesture_progress),
+                        d(field::SWIPE_EXIT_VX, fields.raw_field_129),
+                        d(field::SWIPE_EXIT_VY, fields.raw_field_130),
+                    ],
+                }]
+            })
+            .unwrap_or_default(),
     }
+}
+
+fn create_gesture_event(s: &Synth) -> Option<CFRetained<CGEvent>> {
+    let event = CGEvent::new(None)?;
+    CGEvent::set_type(Some(&event), CGEventType(s.ty));
+    for &(field, value, is_double) in &s.fields {
+        if is_double {
+            CGEvent::set_double_value_field(Some(&event), CGEventField(field), value);
+        } else {
+            CGEvent::set_integer_value_field(Some(&event), CGEventField(field), value as i64);
+        }
+    }
+    CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, MAGIC);
+    Some(event)
 }
 
 /// 投递合成的手势事件（位置取当前光标，应用内手势发给光标下的窗口）。
 pub(crate) fn post_gesture(g: &Gesture) -> bool {
-    for (frame, s) in synth_gesture(g).into_iter().enumerate() {
-        let Some(ev): Option<CFRetained<CGEvent>> = CGEvent::new(None) else {
+    let frames = synth_gesture(g);
+    if frames.is_empty() {
+        return false;
+    }
+    for (frame, s) in frames.into_iter().enumerate() {
+        let Some(event) = create_gesture_event(&s) else {
             tracing::warn!(
                 ?g,
                 frame,
@@ -299,23 +414,14 @@ pub(crate) fn post_gesture(g: &Gesture) -> bool {
             );
             return false;
         };
-        CGEvent::set_type(Some(&ev), CGEventType(s.ty));
-        for (f, v, dbl) in s.fields {
-            if dbl {
-                CGEvent::set_double_value_field(Some(&ev), CGEventField(f), v);
-            } else {
-                CGEvent::set_integer_value_field(Some(&ev), CGEventField(f), v as i64);
-            }
-        }
-        CGEvent::set_integer_value_field(Some(&ev), CGEventField::EventSourceUserData, MAGIC);
         tracing::debug!(
             ?g,
             frame,
             event_type = s.ty,
-            timestamp_ns = CGEvent::timestamp(Some(&ev)),
+            timestamp_ns = CGEvent::timestamp(Some(&event)),
             "gesture injection: posting native frame (delivery unconfirmed)"
         );
-        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&ev));
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
     }
     true
 }
@@ -326,6 +432,105 @@ mod tests {
     use std::collections::HashMap;
 
     // Runs on libtest's worker, with no AppKit main loop and no event posting.
+    #[test]
+    fn notification_center_shortcut_allocates_a_balanced_tagged_pair() {
+        assert!(!super::super::main_queue::is_main_thread());
+        let [down, up] = notification_center_key_events().unwrap();
+        for (event, ty, pressed) in [(&down, CGEventType::KeyDown, true), (&up, CGEventType::KeyUp, false)] {
+            assert_eq!(CGEvent::r#type(Some(event)), ty);
+            assert_eq!(
+                CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode),
+                0x2d
+            );
+            assert_eq!(
+                CGEvent::flags(Some(event)).0 & CGEventFlags::MaskSecondaryFn.0,
+                CGEventFlags::MaskSecondaryFn.0
+            );
+            assert_eq!(
+                CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData),
+                MAGIC
+            );
+            assert_eq!(pressed, ty == CGEventType::KeyDown);
+        }
+    }
+
+    #[test]
+    fn native_notification_center_frame_replays_captured_fields_and_marker() {
+        assert!(!super::super::main_queue::is_main_thread());
+        let native = NotificationCenterNativeFields {
+            motion: gesture_motion::FROM_RIGHT_EDGE,
+            flavor: gesture_flavor::NOTIFICATION_CENTER_SECONDARY,
+            swipe_phase: phase_bits::CHANGED,
+            progress: -0.375,
+            progress_f32_bits: i64::from((-0.375_f32).to_bits()),
+            gesture_progress: 0.625,
+            inverted_from_device: 1,
+            raw_field_129: 3.5,
+            raw_field_130: -4.5,
+        };
+        let gesture = Gesture::NotificationCenter {
+            phase: GesturePhase::Changed,
+            native: Some(native),
+        };
+        let synth = synth_gesture(&gesture);
+        assert_eq!(synth.len(), 1);
+        assert_eq!(synth[0].ty, TYPE_FLUID_TOUCH_GESTURE);
+        let event = create_gesture_event(&synth[0]).unwrap();
+        assert_eq!(CGEvent::r#type(Some(&event)).0, TYPE_FLUID_TOUCH_GESTURE);
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField::EventSourceUserData),
+            MAGIC
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(field::SWIPE_MOTION)),
+            native.motion
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(field::GESTURE_FLAVOR)),
+            native.flavor
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(field::PHASE)),
+            phase_bits::CHANGED
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(field::SWIPE_PHASE)),
+            native.swipe_phase
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(field::SWIPE_PROGRESS_F32)),
+            native.progress_f32_bits
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(field::SWIPE_INVERTED_FROM_DEVICE)),
+            native.inverted_from_device
+        );
+        assert_eq!(
+            CGEvent::double_value_field(Some(&event), CGEventField(field::SWIPE_PROGRESS)),
+            native.progress
+        );
+        assert_eq!(
+            CGEvent::double_value_field(Some(&event), CGEventField(field::GESTURE_PROGRESS)),
+            native.gesture_progress
+        );
+        assert_eq!(
+            CGEvent::double_value_field(Some(&event), CGEventField(field::SWIPE_EXIT_VX)),
+            native.raw_field_129
+        );
+        assert_eq!(
+            CGEvent::double_value_field(Some(&event), CGEventField(field::SWIPE_EXIT_VY)),
+            native.raw_field_130
+        );
+        assert_eq!(
+            parse_gesture(
+                TYPE_FLUID_TOUCH_GESTURE,
+                |field| CGEvent::integer_value_field(Some(&event), CGEventField(field)),
+                |field| CGEvent::double_value_field(Some(&event), CGEventField(field)),
+            ),
+            Some(gesture)
+        );
+    }
+
     #[test]
     fn aux_fields_roundtrip_on_background_thread() {
         assert!(!super::super::main_queue::is_main_thread());
@@ -367,6 +572,32 @@ mod tests {
     }
 
     /// 合成的事件再按截获的规则解析，得到原来的手势（Mac → Mac 重放不失真）。
+    #[test]
+    fn notification_center_without_complete_candidate_metadata_is_not_synthesized() {
+        for native in [
+            None,
+            Some(NotificationCenterNativeFields {
+                motion: 9,
+                flavor: 1,
+                swipe_phase: 0,
+                progress: 0.0,
+                progress_f32_bits: 0,
+                gesture_progress: 0.0,
+                inverted_from_device: 0,
+                raw_field_129: 0.0,
+                raw_field_130: 0.0,
+            }),
+        ] {
+            assert!(
+                synth_gesture(&Gesture::NotificationCenter {
+                    phase: GesturePhase::Began,
+                    native,
+                })
+                .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn synthesized_gestures_parse_back() {
         let cases = [
@@ -530,6 +761,144 @@ mod tests {
         assert_eq!(ints[&field::SWIPE_PROGRESS_F32], i64::from((-1.0f32).to_bits()));
         assert_eq!(dbls[&field::SWIPE_EXIT_VY], -2.0);
         assert_eq!(s[1].ty, TYPE_GESTURE);
+    }
+
+    #[test]
+    fn fluid_touch_notification_center_preserves_candidate_fields_and_gates_motion() {
+        for flavor in [
+            gesture_flavor::NOTIFICATION_CENTER_PRIMARY,
+            gesture_flavor::NOTIFICATION_CENTER_SECONDARY,
+        ] {
+            for (bits, phase) in [
+                (phase_bits::BEGAN, GesturePhase::Began),
+                (phase_bits::CHANGED, GesturePhase::Changed),
+                (phase_bits::ENDED, GesturePhase::Ended),
+                (phase_bits::CANCELLED, GesturePhase::Cancelled),
+            ] {
+                let native = NotificationCenterNativeFields {
+                    motion: gesture_motion::FROM_RIGHT_EDGE,
+                    flavor,
+                    swipe_phase: bits,
+                    progress: -0.25,
+                    progress_f32_bits: i64::from((-0.25_f32).to_bits()),
+                    gesture_progress: 0.75,
+                    inverted_from_device: 1,
+                    raw_field_129: 3.5,
+                    raw_field_130: -4.5,
+                };
+                let ints = HashMap::from([
+                    (field::HID_TYPE, hid_type::FLUID_TOUCH_GESTURE),
+                    (field::SWIPE_MOTION, native.motion),
+                    (field::GESTURE_FLAVOR, native.flavor),
+                    (field::PHASE, bits),
+                    (field::SWIPE_PHASE, native.swipe_phase),
+                    (field::SWIPE_PROGRESS_F32, native.progress_f32_bits),
+                    (field::SWIPE_INVERTED_FROM_DEVICE, native.inverted_from_device),
+                ]);
+                assert_eq!(
+                    parse_gesture(
+                        TYPE_FLUID_TOUCH_GESTURE,
+                        |f| ints.get(&f).copied().unwrap_or(0),
+                        |f| match f {
+                            field::SWIPE_PROGRESS => native.progress,
+                            field::GESTURE_PROGRESS => native.gesture_progress,
+                            field::SWIPE_EXIT_VX => native.raw_field_129,
+                            field::SWIPE_EXIT_VY => native.raw_field_130,
+                            _ => 0.0,
+                        },
+                    ),
+                    Some(Gesture::NotificationCenter {
+                        phase,
+                        native: Some(native),
+                    })
+                );
+            }
+        }
+
+        let fields = |motion, flavor, phase| {
+            HashMap::from([
+                (field::HID_TYPE, hid_type::FLUID_TOUCH_GESTURE),
+                (field::SWIPE_MOTION, motion),
+                (field::GESTURE_FLAVOR, flavor),
+                (field::PHASE, phase),
+            ])
+        };
+        let alternate = fields(gesture_motion::CANDIDATE_ALTERNATE, 1, phase_bits::ENDED);
+        assert!(
+            parse_gesture(
+                TYPE_FLUID_TOUCH_GESTURE,
+                |f| alternate.get(&f).copied().unwrap_or(0),
+                |_| 0.0,
+            )
+            .is_some(),
+            "motion=1 is the production native close candidate"
+        );
+        let mismatched_phase = HashMap::from([
+            (field::HID_TYPE, hid_type::FLUID_TOUCH_GESTURE),
+            (field::SWIPE_MOTION, gesture_motion::FROM_RIGHT_EDGE),
+            (field::GESTURE_FLAVOR, gesture_flavor::NOTIFICATION_CENTER_PRIMARY),
+            (field::PHASE, phase_bits::CHANGED),
+            (field::SWIPE_PHASE, phase_bits::ENDED),
+        ]);
+        assert_eq!(
+            parse_gesture(
+                TYPE_FLUID_TOUCH_GESTURE,
+                |f| mismatched_phase.get(&f).copied().unwrap_or(0),
+                |_| 0.0,
+            ),
+            Some(Gesture::NotificationCenter {
+                phase: GesturePhase::Changed,
+                native: None,
+            })
+        );
+
+        for (ty, ints) in [
+            (TYPE_FLUID_TOUCH_GESTURE, fields(2, 1, phase_bits::ENDED)),
+            (TYPE_FLUID_TOUCH_GESTURE, fields(9, 3, phase_bits::ENDED)),
+            (TYPE_FLUID_TOUCH_GESTURE, fields(9, 1, 128)),
+            (TYPE_DOCK_CONTROL, fields(9, 1, phase_bits::ENDED)),
+        ] {
+            assert_eq!(parse_gesture(ty, |f| ints.get(&f).copied().unwrap_or(0), |_| 0.0), None);
+        }
+    }
+
+    #[test]
+    fn motion_one_close_replays_native_fields() {
+        for (phase, bits, progress) in [
+            (GesturePhase::Began, phase_bits::BEGAN, 0.0),
+            (GesturePhase::Changed, phase_bits::CHANGED, 0.25),
+            (GesturePhase::Ended, phase_bits::ENDED, 1.0),
+        ] {
+            let native = NotificationCenterNativeFields {
+                motion: gesture_motion::CANDIDATE_ALTERNATE,
+                flavor: gesture_flavor::NOTIFICATION_CENTER_PRIMARY,
+                swipe_phase: bits,
+                progress,
+                progress_f32_bits: i64::from((progress as f32).to_bits()),
+                gesture_progress: 0.0,
+                inverted_from_device: 0,
+                raw_field_129: 0.0,
+                raw_field_130: 0.0,
+            };
+            let gesture = Gesture::NotificationCenter {
+                phase,
+                native: Some(native),
+            };
+            let synth = synth_gesture(&gesture);
+            assert_eq!(synth.len(), 1);
+            assert_eq!(synth[0].ty, TYPE_FLUID_TOUCH_GESTURE);
+            let (ints, dbls) = fields_of(&synth[0]);
+            assert_eq!(ints[&field::SWIPE_MOTION], 1);
+            assert_eq!(ints[&field::GESTURE_FLAVOR], 1);
+            assert_eq!(ints[&field::PHASE], bits);
+            assert_eq!(ints[&field::SWIPE_PHASE], bits);
+            assert_eq!(ints[&field::SWIPE_INVERTED_FROM_DEVICE], 0);
+            assert_eq!(ints[&field::SWIPE_PROGRESS_F32], native.progress_f32_bits);
+            assert_eq!(dbls[&field::SWIPE_PROGRESS], progress);
+            assert_eq!(dbls[&field::GESTURE_PROGRESS], 0.0);
+            assert_eq!(dbls[&field::SWIPE_EXIT_VX], 0.0);
+            assert_eq!(dbls[&field::SWIPE_EXIT_VY], 0.0);
+        }
     }
 
     #[test]

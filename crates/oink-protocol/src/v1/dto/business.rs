@@ -66,6 +66,7 @@ wire_map!(ControlCursorTrailHandoff, no_validation, {
 wire_map!(InputCapability, validate_input_capability, {
     1 => controllable: bool = required;
     2 => max_contacts: u8 = 0;
+    3 => notification_center_actions: bool = false;
 });
 
 hot_map!(InputMotion, no_validation, {

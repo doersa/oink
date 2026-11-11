@@ -523,6 +523,7 @@ impl InputThread {
             *first = oink_routing::Packet::Control(oink_routing::control::ControlMsg::InputCapability {
                 controllable,
                 touchpad_contacts: self.touchpad_contacts(),
+                notification_center_actions: cfg!(target_os = "macos"),
             });
         }
         opening

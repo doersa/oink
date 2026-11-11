@@ -143,6 +143,10 @@
         [
           3,
           "SmartMagnify"
+        ],
+        [
+          4,
+          "NotificationCenter"
         ]
       ]
     ],
@@ -484,6 +488,10 @@
         [
           3,
           "SmartMagnify"
+        ],
+        [
+          4,
+          "NotificationCenter"
         ]
       ]
     ],
@@ -4950,6 +4958,12 @@
             "key": 2,
             "name": "max_contacts",
             "shape": "u8"
+          },
+          {
+            "absence": "false",
+            "key": 3,
+            "name": "notification_center_actions",
+            "shape": "bool"
           }
         ],
         "name": "InputCapability"
@@ -24002,6 +24016,12 @@
           "key": 2,
           "name": "max_contacts",
           "shape": "u8"
+        },
+        {
+          "absence": "false",
+          "key": 3,
+          "name": "notification_center_actions",
+          "shape": "bool"
         }
       ],
       "name": "InputCapability"

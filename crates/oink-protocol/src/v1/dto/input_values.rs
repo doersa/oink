@@ -9,7 +9,7 @@ hot_map!(OtherMouseButton,no_validation,{1=>number:u8=required;});
 enum_body!(MouseButtonKind {Other=>OtherMouseButton});
 pub type MouseButton = OpenEnvelope<MouseButtonKind>;
 
-open_enum!(GestureKind {DockSwipe=0,Magnify=1,Rotate=2,SmartMagnify=3});
+open_enum!(GestureKind {DockSwipe=0,Magnify=1,Rotate=2,SmartMagnify=3,NotificationCenter=4});
 open_enum!(GesturePhase {Began=0,Changed=1,Ended=2,Cancelled=3});
 open_enum!(SwipeAxis {Horizontal=0,Vertical=1,Pinch=2});
 hot_map!(DockSwipe,no_validation,{
@@ -17,7 +17,14 @@ hot_map!(DockSwipe,no_validation,{
 });
 hot_map!(Magnify,no_validation,{1=>phase:GesturePhase=required;2=>amount:f64=required;});
 hot_map!(Rotate,no_validation,{1=>phase:GesturePhase=required;2=>degrees:f64=required;});
-enum_body!(GestureKind {DockSwipe=>DockSwipe,Magnify=>Magnify,Rotate=>Rotate});
+hot_map!(NotificationCenterGesture,no_validation,{
+    1=>phase:GesturePhase=required;
+    2=>motion:Option<i64>=optional;3=>flavor:Option<i64>=optional;4=>swipe_phase:Option<i64>=optional;
+    5=>progress:Option<f64>=optional;6=>progress_f32_bits:Option<i64>=optional;
+    7=>gesture_progress:Option<f64>=optional;8=>inverted_from_device:Option<i64>=optional;
+    9=>raw_field_129:Option<f64>=optional;10=>raw_field_130:Option<f64>=optional;
+});
+enum_body!(GestureKind {DockSwipe=>DockSwipe,Magnify=>Magnify,Rotate=>Rotate,NotificationCenter=>NotificationCenterGesture});
 pub type Gesture = OpenEnvelope<GestureKind>;
 
 macro_rules! hot_envelope {
@@ -44,7 +51,7 @@ macro_rules! hot_envelope {
     };
 }
 hot_envelope!(MouseButton,MouseButtonKind,{Other=>OtherMouseButton});
-hot_envelope!(Gesture,GestureKind,{DockSwipe=>DockSwipe,Magnify=>Magnify,Rotate=>Rotate});
+hot_envelope!(Gesture,GestureKind,{DockSwipe=>DockSwipe,Magnify=>Magnify,Rotate=>Rotate,NotificationCenter=>NotificationCenterGesture});
 
 hot_map!(ContactSurface,no_validation,{1=>width:u32=required;2=>height:u32=required;});
 hot_map!(ContactPoint,no_validation,{1=>id:u32=required;2=>x:i32=required;3=>y:i32=required;});

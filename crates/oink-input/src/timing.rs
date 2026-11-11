@@ -27,7 +27,7 @@ impl CallClass {
             Button { .. } => Self::Button,
             Key { .. } | KeyWithoutLock { .. } | Volume { .. } => Self::Key,
             Scroll { .. } | TouchpadScroll { .. } => Self::Scroll,
-            Gesture(_) | TouchpadContacts(_) => Self::Gesture,
+            Gesture(_) | NotificationCenter | TouchpadContacts(_) => Self::Gesture,
         }
     }
 }

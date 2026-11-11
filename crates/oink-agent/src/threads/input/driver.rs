@@ -1302,6 +1302,7 @@ impl Driver {
                     if clip_decision(&message) {
                         self.refresh_system_cursor_clip();
                     }
+                    self.refresh_local_notification_center_state();
                     self.adapter.inbound(peer, message);
                 }
             }
@@ -1372,6 +1373,14 @@ impl Driver {
         }
         self.outputs(None);
     }
+    /// Refresh the router from the backend's cached local AX snapshot before any
+    /// inbound event is routed. The accessor is nonblocking and performs no OS query.
+    fn refresh_local_notification_center_state(&mut self) {
+        self.adapter
+            .router_mut()
+            .set_local_notification_center_state(self.inject.backend().notification_center_panel_state());
+    }
+
     fn current_inbound(&self, peer: DeviceId, stream: StreamId) -> bool {
         self.pairs
             .get(&peer)

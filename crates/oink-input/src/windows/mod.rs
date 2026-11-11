@@ -719,6 +719,7 @@ impl InputBackend for WinInput {
                 }
                 run_actions(&actions)
             }
+            InjectEvent::NotificationCenter => Err(InputError::Unsupported),
         }
     }
 

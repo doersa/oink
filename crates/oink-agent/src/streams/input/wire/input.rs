@@ -138,6 +138,74 @@ fn read_gesture(gesture: View<'_, w::Gesture>) -> v1::Result<n::Gesture> {
             }
         }
         w::GestureKind::SmartMagnify => n::Gesture::SmartMagnify,
+        w::GestureKind::NotificationCenter => {
+            let v = View::<w::NotificationCenterGesture>::from_map(gesture.body()?)?;
+            let native = match (
+                (
+                    v.motion()?,
+                    v.flavor()?,
+                    v.swipe_phase()?,
+                    v.progress()?,
+                    v.progress_f32_bits()?,
+                    v.gesture_progress()?,
+                    v.inverted_from_device()?,
+                ),
+                (v.raw_field_129()?, v.raw_field_130()?),
+            ) {
+                ((None, None, None, None, None, None, None), (None, None)) => None,
+                (
+                    (
+                        Some(motion),
+                        Some(flavor),
+                        Some(swipe_phase),
+                        Some(progress),
+                        Some(progress_f32_bits),
+                        Some(gesture_progress),
+                        Some(inverted_from_device),
+                    ),
+                    (None, None),
+                ) => Some(n::NotificationCenterNativeFields {
+                    motion,
+                    flavor,
+                    swipe_phase,
+                    progress,
+                    progress_f32_bits,
+                    gesture_progress,
+                    inverted_from_device,
+                    // Compatibility with native experiment payloads predating
+                    // the opaque fields 129/130.
+                    raw_field_129: 0.0,
+                    raw_field_130: 0.0,
+                }),
+                (
+                    (
+                        Some(motion),
+                        Some(flavor),
+                        Some(swipe_phase),
+                        Some(progress),
+                        Some(progress_f32_bits),
+                        Some(gesture_progress),
+                        Some(inverted_from_device),
+                    ),
+                    (Some(raw_field_129), Some(raw_field_130)),
+                ) => Some(n::NotificationCenterNativeFields {
+                    motion,
+                    flavor,
+                    swipe_phase,
+                    progress,
+                    progress_f32_bits,
+                    gesture_progress,
+                    inverted_from_device,
+                    raw_field_129,
+                    raw_field_130,
+                }),
+                _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
+            };
+            n::Gesture::NotificationCenter {
+                phase: read_gesture_phase(v.phase()?)?,
+                native,
+            }
+        }
         _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
     })
 }
@@ -278,7 +346,7 @@ pub(super) fn encode(input: &InputMsg, time: Option<n::CaptureTime>, out: &mut [
             )
         }
         InputMsg::Gesture { source: kind, gesture } => {
-            let mut body = [(0, V::Null); 4];
+            let mut body = [(0, V::Null); 10];
             let (tag, len) = match gesture {
                 n::Gesture::DockSwipe {
                     axis: value,
@@ -286,12 +354,10 @@ pub(super) fn encode(input: &InputMsg, time: Option<n::CaptureTime>, out: &mut [
                     progress,
                     velocity,
                 } => {
-                    body = [
-                        (1, V::Uint(axis(*value))),
-                        (2, V::Uint(gesture_phase(*phase))),
-                        (3, V::F64(*progress)),
-                        (4, V::F64(*velocity)),
-                    ];
+                    body[0] = (1, V::Uint(axis(*value)));
+                    body[1] = (2, V::Uint(gesture_phase(*phase)));
+                    body[2] = (3, V::F64(*progress));
+                    body[3] = (4, V::F64(*velocity));
                     (0, 4)
                 }
                 n::Gesture::Magnify { phase, amount } => {
@@ -305,6 +371,23 @@ pub(super) fn encode(input: &InputMsg, time: Option<n::CaptureTime>, out: &mut [
                     (2, 2)
                 }
                 n::Gesture::SmartMagnify => (3, 0),
+                n::Gesture::NotificationCenter { phase, native } => {
+                    body[0] = (1, V::Uint(gesture_phase(*phase)));
+                    if let Some(native) = native {
+                        body[1] = (2, V::Int(native.motion));
+                        body[2] = (3, V::Int(native.flavor));
+                        body[3] = (4, V::Int(native.swipe_phase));
+                        body[4] = (5, V::F64(native.progress));
+                        body[5] = (6, V::Int(native.progress_f32_bits));
+                        body[6] = (7, V::F64(native.gesture_progress));
+                        body[7] = (8, V::Int(native.inverted_from_device));
+                        body[8] = (9, V::F64(native.raw_field_129));
+                        body[9] = (10, V::F64(native.raw_field_130));
+                        (4, 10)
+                    } else {
+                        (4, 1)
+                    }
+                }
             };
             let envelope = [(1, V::Uint(tag)), (2, V::Map(&body[..len]))];
             emit(
@@ -691,12 +774,70 @@ mod tests {
         );
     }
     #[test]
+    fn older_native_notification_center_payload_defaults_opaque_fields() {
+        let candidate = [
+            (1, V::Uint(gesture_phase(n::GesturePhase::Began))),
+            (2, V::Int(9)),
+            (3, V::Int(1)),
+            (4, V::Int(1)),
+            (5, V::F64(0.125)),
+            (6, V::Int(i64::from(0.125_f32.to_bits()))),
+            (7, V::F64(0.0)),
+            (8, V::Int(0)),
+        ];
+        let gesture = [(1, V::Uint(4)), (2, V::Map(&candidate))];
+        let fields = [(1, V::Uint(source(n::SourceKind::Touchpad))), (2, V::Map(&gesture))];
+        let mut bytes = [0; v1::limits::RELIABLE_FRAME];
+        let len = frame("InputGesture", &fields, None, 0, None, &mut bytes).unwrap();
+        let Packet::Input(InputMsg::Gesture { gesture, .. }) =
+            decode(OpaqueFrame::parse_exact(&bytes[..len], bytes.len()).unwrap()).unwrap()
+        else {
+            panic!("notification center gesture")
+        };
+        assert_eq!(
+            gesture,
+            n::Gesture::NotificationCenter {
+                phase: n::GesturePhase::Began,
+                native: Some(n::NotificationCenterNativeFields {
+                    motion: 9,
+                    flavor: 1,
+                    swipe_phase: 1,
+                    progress: 0.125,
+                    progress_f32_bits: i64::from(0.125_f32.to_bits()),
+                    gesture_progress: 0.0,
+                    inverted_from_device: 0,
+                    raw_field_129: 0.0,
+                    raw_field_130: 0.0,
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn typed_mouse_gestures_and_integer_contact_geometry_roundtrip() {
         for button in [n::MouseButton::Left, n::MouseButton::Other(31)] {
             roundtrip(InputMsg::Button { button, pressed: true });
         }
         for gesture in [
             n::Gesture::SmartMagnify,
+            n::Gesture::NotificationCenter {
+                phase: n::GesturePhase::Ended,
+                native: None,
+            },
+            n::Gesture::NotificationCenter {
+                phase: n::GesturePhase::Changed,
+                native: Some(n::NotificationCenterNativeFields {
+                    motion: 1,
+                    flavor: 2,
+                    swipe_phase: 2,
+                    progress: -0.375,
+                    progress_f32_bits: i64::from((-0.375_f32).to_bits()),
+                    gesture_progress: 0.625,
+                    inverted_from_device: -1,
+                    raw_field_129: 3.5,
+                    raw_field_130: -4.5,
+                }),
+            },
             n::Gesture::DockSwipe {
                 axis: n::SwipeAxis::Pinch,
                 phase: n::GesturePhase::Changed,

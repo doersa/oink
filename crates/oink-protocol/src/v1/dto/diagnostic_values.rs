@@ -22,13 +22,14 @@ pub type DiagMouseButton = OpenEnvelope<DiagMouseButtonKind>;
 open_enum!(DiagScrollUnit { Pixel=0,Line=1 });
 open_enum!(DiagGesturePhase { Began=0,Changed=1,Ended=2,Cancelled=3 });
 open_enum!(DiagSwipeAxis { Horizontal=0,Vertical=1,Pinch=2 });
-open_enum!(DiagGestureKind { DockSwipe=0,Magnify=1,Rotate=2,SmartMagnify=3 });
+open_enum!(DiagGestureKind { DockSwipe=0,Magnify=1,Rotate=2,SmartMagnify=3,NotificationCenter=4 });
 wire_map!(DiagDockSwipe,no_validation,{
     1=>axis:DiagSwipeAxis=required;2=>phase:DiagGesturePhase=required;3=>progress:f64=required;4=>velocity:f64=required;
 });
 wire_map!(DiagMagnify,no_validation,{1=>phase:DiagGesturePhase=required;2=>amount:f64=required;});
 wire_map!(DiagRotate,no_validation,{1=>phase:DiagGesturePhase=required;2=>degrees:f64=required;});
-enum_body!(DiagGestureKind { DockSwipe=>DiagDockSwipe,Magnify=>DiagMagnify,Rotate=>DiagRotate });
+wire_map!(DiagNotificationCenter,no_validation,{1=>phase:DiagGesturePhase=required;});
+enum_body!(DiagGestureKind { DockSwipe=>DiagDockSwipe,Magnify=>DiagMagnify,Rotate=>DiagRotate,NotificationCenter=>DiagNotificationCenter });
 pub type DiagGesture = OpenEnvelope<DiagGestureKind>;
 open_enum!(DiagSafeInputKind { ContactsOmitted=0,Motion=1,Position=2,Button=3,Scroll=4,Key=5,Gesture=6,ScrollDistance=7,RemoteMotion=8,RelativeTotals=9 });
 wire_map!(DiagMotion,no_validation,{1=>dx:f64=required;2=>dy:f64=required;3=>raw:bool=required;});

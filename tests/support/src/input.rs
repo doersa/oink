@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use oink_foundation::Point;
 use oink_foundation::input::{
-    CaptureMode, CapturedEvent, Disposition, FeelProfile, InjectEvent, InputPermissions, PermissionState,
+    CaptureMode, CapturedEvent, Disposition, FeelProfile, InjectEvent, InputPermissions, NotificationCenterPanelState,
+    PermissionState,
 };
 
 use oink_input::{EventHandler, InputBackend, InputError};
@@ -47,6 +48,7 @@ struct State {
     activity_declarations: u64,
     displays_asleep: bool,
     held_session_keys: Vec<oink_input::KeyCode>,
+    notification_center_panel_state: NotificationCenterPanelState,
 }
 
 /// 排队中的模式切换。
@@ -288,6 +290,10 @@ impl FakeInput {
         self.state.lock().unwrap().cursor = p;
     }
 
+    pub fn set_notification_center_panel_state(&self, state: NotificationCenterPanelState) {
+        self.state.lock().unwrap().notification_center_panel_state = state;
+    }
+
     /// 模式切换是否延迟生效（见模块说明）。关闭时立即执行已排队的切换。
     pub fn set_deferred_modes(&self, deferred: bool) {
         let mut s = self.state.lock().unwrap();
@@ -457,6 +463,9 @@ impl InputBackend for FakeInput {
 
     fn touchpad_contacts(&self) -> Option<u8> {
         self.state.lock().unwrap().touchpad_contacts
+    }
+    fn notification_center_panel_state(&self) -> NotificationCenterPanelState {
+        self.state.lock().unwrap().notification_center_panel_state
     }
     fn start_injection_session(&self) -> Result<(), InputError> {
         let blocked = self.state.lock().unwrap().injection_start.take();

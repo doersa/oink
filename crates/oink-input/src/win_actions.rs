@@ -181,7 +181,7 @@ impl GestureMapper {
                     vec![WinAction::CtrlWheel(notches as i32)]
                 }
             }
-            Gesture::Rotate { .. } | Gesture::SmartMagnify => Vec::new(),
+            Gesture::Rotate { .. } | Gesture::SmartMagnify | Gesture::NotificationCenter { .. } => Vec::new(),
         }
     }
     fn foreground(&self) -> ForegroundState {

@@ -50,10 +50,12 @@ pub(crate) fn injection_result(
                 Gesture::Magnify { phase, .. } => (3, phase),
                 Gesture::Rotate { phase, .. } => (4, phase),
                 Gesture::SmartMagnify => (5, oink_foundation::input::GesturePhase::Ended),
+                Gesture::NotificationCenter { phase, .. } => (6, phase),
             };
             (2_u8, kind, phase as u8, g.starts() || g.ends())
         }
         InjectEvent::TouchpadContacts(f) => (1, 0, f.phase as u8, f.phase != oink_foundation::contacts::Phase::Move),
+        InjectEvent::NotificationCenter => (3, 1, oink_foundation::input::GesturePhase::Ended as u8, true),
         _ => return None,
     };
     if !boundary && result.is_ok() {
@@ -102,6 +104,46 @@ pub(crate) fn event(o: Observation) -> Event {
         line: 0,
         level: 2,
         fields,
+        labels: vec![],
+    }
+}
+
+/// Formatting happens on the ordinary recorder thread, never on the Quartz callback.
+pub(crate) fn gesture_tap(o: oink_input::native_lifecycle::GestureTapObservation) -> Event {
+    Event::Log {
+        module: "macos_gesture_tap".into(),
+        line: 0,
+        level: 2,
+        fields: [
+            ("event_type", o.event_type as f64),
+            ("event_type_field_55", o.event_type_field as f64),
+            ("hid_type_110", o.hid_type as f64),
+            ("phase_132", o.phase as f64),
+            ("swipe_phase_134", o.swipe_phase as f64),
+            ("motion_123", o.motion as f64),
+            ("progress_124", o.progress),
+            ("candidate_field_129", o.raw_field_129),
+            ("candidate_field_130", o.raw_field_130),
+            ("magnification_113", o.magnification),
+            ("rotation_114", o.rotation),
+            ("preflight_111", o.preflight as f64),
+            ("series_type_117", o.series_type as f64),
+            ("flavor_138", o.flavor as f64),
+            ("gesture_progress_142", o.gesture_progress),
+            ("gesture_stage_143", o.gesture_stage as f64),
+            ("gesture_behavior_144", o.gesture_behavior as f64),
+            ("inverted_from_device_136", o.inverted_from_device as f64),
+            ("parsed_kind", f64::from(o.parsed_kind)),
+            ("physical", u8::from(o.physical) as f64),
+            ("own", u8::from(o.own) as f64),
+            ("remote", u8::from(o.remote) as f64),
+            ("tap_return_pass", u8::from(o.passed) as f64),
+            ("native_timestamp_us", o.native_timestamp_us as f64),
+            ("suppressed", o.suppressed as f64),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect(),
         labels: vec![],
     }
 }
@@ -159,6 +201,95 @@ mod tests {
     use super::*;
     use crate::diagnostics::{Reason, Recorder};
     use oink_foundation::DeviceId;
+
+    #[test]
+    fn raw_gesture_tap_fields_are_exported_without_process_or_contact_identity() {
+        let event = gesture_tap(oink_input::native_lifecycle::GestureTapObservation {
+            event_type: 31,
+            event_type_field: 31,
+            hid_type: 61,
+            phase: 1,
+            swipe_phase: 0,
+            motion: 2,
+            progress: -0.25,
+            raw_field_129: 0.125,
+            raw_field_130: -0.25,
+            magnification: 0.0,
+            rotation: 0.0,
+            inverted_from_device: 1,
+            parsed_kind: 0,
+            physical: true,
+            own: false,
+            remote: true,
+            passed: false,
+            native_timestamp_us: 1234,
+            suppressed: 7,
+            ..Default::default()
+        });
+        let Event::Log {
+            module, fields, labels, ..
+        } = event
+        else {
+            panic!("gesture tap observation must be a numeric log");
+        };
+        let values: std::collections::BTreeMap<String, f64> = fields.into_iter().collect();
+        assert_eq!(module, "macos_gesture_tap");
+        assert!(labels.is_empty());
+        assert_eq!(values["event_type"], 31.);
+        assert_eq!(values["hid_type_110"], 61.);
+        assert_eq!(values["progress_124"], -0.25);
+        assert_eq!(values["candidate_field_129"], 0.125);
+        assert_eq!(values["candidate_field_130"], -0.25);
+        assert_eq!(values["physical"], 1.);
+        assert_eq!(values["remote"], 1.);
+        assert_eq!(values["tap_return_pass"], 0.);
+        assert_eq!(values["suppressed"], 7.);
+        assert_eq!(values.len(), 25);
+        assert!(
+            !values
+                .keys()
+                .any(|key| key.contains("pid") || key.contains("coordinate") || key.contains("contact"))
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(dir.path().into(), DeviceId([1; 32]), None, true).unwrap();
+        recorder.wait_recovery();
+        recorder.record_native(
+            None,
+            gesture_tap(oink_input::native_lifecycle::GestureTapObservation {
+                event_type: 31,
+                hid_type: 61,
+                progress: -0.25,
+                physical: true,
+                remote: true,
+                passed: false,
+                ..Default::default()
+            }),
+        );
+        let bundle = recorder.save(Reason::Manual).unwrap();
+        let rows = super::super::tests::timeline(&bundle.path, "merged.ndjson");
+        let log = rows
+            .iter()
+            .find_map(|row| {
+                let log = row["event"].get("Log")?;
+                (log["module"] == "macos_gesture_tap").then_some(log)
+            })
+            .unwrap();
+        let archived: std::collections::BTreeMap<String, f64> =
+            serde_json::from_value::<Vec<(String, f64)>>(log["fields"].clone())
+                .unwrap()
+                .into_iter()
+                .collect();
+        assert_eq!(archived["event_type"], 31.);
+        assert_eq!(archived["hid_type_110"], 61.);
+        assert_eq!(archived["progress_124"], -0.25);
+        assert_eq!(archived["candidate_field_129"], 0.);
+        assert_eq!(archived["candidate_field_130"], 0.);
+        assert_eq!(archived["physical"], 1.);
+        assert_eq!(archived["remote"], 1.);
+        assert_eq!(archived["tap_return_pass"], 0.);
+        recorder.shutdown();
+    }
 
     #[test]
     fn raw_mt_states_frames_and_sensor_bits_survive_export_without_geometry() {

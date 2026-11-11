@@ -186,6 +186,41 @@ pub struct Data {
     pub hidden_before: Option<bool>,
     pub steps: Option<u32>,
 }
+/// Bounded observation of one raw macOS gesture-family CGEvent. No process IDs,
+/// device addresses, contact coordinates, key payloads, or window information.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GestureTapObservation {
+    pub event_type: u32,
+    pub event_type_field: i64,
+    pub hid_type: i64,
+    pub phase: i64,
+    pub swipe_phase: i64,
+    pub motion: i64,
+    pub progress: f64,
+    /// Candidate floating-point values retained only for bounded Quartz diagnosis.
+    pub raw_field_129: f64,
+    pub raw_field_130: f64,
+    pub magnification: f64,
+    pub rotation: f64,
+    pub preflight: i64,
+    pub series_type: i64,
+    pub flavor: i64,
+    pub gesture_progress: f64,
+    pub gesture_stage: i64,
+    pub gesture_behavior: i64,
+    pub inverted_from_device: i64,
+    /// 0=unparsed, 1=DockSwipe, 2=Magnify, 3=Rotate, 4=SmartMagnify, 5=NotificationCenter.
+    pub parsed_kind: u8,
+    pub physical: bool,
+    pub own: bool,
+    pub remote: bool,
+    /// Whether the callback returned the native event to WindowServer.
+    pub passed: bool,
+    pub native_timestamp_us: u64,
+    /// Raw events omitted by the per-second sample budget since the previous row.
+    pub suppressed: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Record {
     /// Transient stamp, not part of native wire/event serialization.
@@ -197,6 +232,7 @@ pub struct Record {
     /// None means the thread has no router owner or it is currently borrowed.
     pub focus: Option<(DeviceId, u64)>,
     pub gesture: Option<crate::gesture_trace::Observation>,
+    pub gesture_tap: Option<GestureTapObservation>,
     pub pointer: Option<crate::pointer_transition::Observation>,
     pub button: Option<crate::button_diagnostics::Transition>,
     pub contacts: Option<crate::contact_trace::Observation>,
@@ -239,12 +275,39 @@ pub fn emit_gesture(stamp: Option<(u64, i64, i64)>, gesture: crate::gesture_trac
         data: Data::default(),
         focus: crate::capture_loop::trace_focus(),
         gesture: Some(gesture),
+        gesture_tap: None,
         pointer: None,
         button: None,
         contacts: None,
         mt_contacts: None,
     };
     buffer.push(record);
+    notify();
+}
+/// Preserve sampled raw gesture events in the same bounded recorder queue.
+#[cfg(target_os = "macos")]
+pub(crate) fn emit_gesture_tap(observation: GestureTapObservation) {
+    if !lifecycle_enabled() {
+        return;
+    }
+    let Some(buffer) = BUFFER.get() else { return };
+    buffer.push(Record {
+        // The Quartz callback must not invoke the clock correlation closure: a
+        // clock-epoch change can allocate. The native timestamp remains in the
+        // observation, while `at_us` records receipt on the bounded queue.
+        stamp: None,
+        at_us: buffer.start.elapsed().as_micros() as u64,
+        sequence: buffer.sequence.fetch_add(1, Ordering::Relaxed),
+        kind: Kind::Gesture,
+        data: Data::default(),
+        focus: crate::capture_loop::trace_focus(),
+        gesture: None,
+        gesture_tap: Some(observation),
+        pointer: None,
+        button: None,
+        contacts: None,
+        mt_contacts: None,
+    });
     notify();
 }
 /// Raw button observations use the same bounded recorder queue, never a key payload.
@@ -258,6 +321,7 @@ pub(crate) fn emit_button(button: crate::button_diagnostics::Transition) {
         data: Data::default(),
         focus: crate::capture_loop::trace_focus(),
         gesture: None,
+        gesture_tap: None,
         pointer: None,
         button: Some(button),
         contacts: None,
@@ -280,6 +344,7 @@ pub fn emit_pointer_transition(pointer: crate::pointer_transition::Observation) 
         data: Data::default(),
         focus: crate::capture_loop::trace_focus(),
         gesture: None,
+        gesture_tap: None,
         pointer: Some(pointer),
         button: None,
         contacts: None,
@@ -327,6 +392,7 @@ fn emit_record(kind: Kind, data: Data, sequence: u64, focus: Option<(DeviceId, u
         data,
         focus,
         gesture: None,
+        gesture_tap: None,
         pointer: None,
         button: None,
         contacts: None,
@@ -351,6 +417,7 @@ pub(crate) fn emit_contacts(contacts: crate::contact_trace::Observation) {
         data: Data::default(),
         focus: crate::capture_loop::trace_focus(),
         gesture: None,
+        gesture_tap: None,
         pointer: None,
         button: None,
         contacts: Some(contacts),
@@ -373,6 +440,7 @@ pub(crate) fn emit_mt_contacts(mt_contacts: crate::mt_trace::Observation) {
         data: Data::default(),
         focus: None,
         gesture: None,
+        gesture_tap: None,
         pointer: None,
         button: None,
         contacts: None,
@@ -432,6 +500,7 @@ mod tests {
             },
             focus: None,
             gesture: None,
+            gesture_tap: None,
             pointer: None,
             button: None,
             contacts: None,

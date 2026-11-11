@@ -138,6 +138,7 @@ impl Driver {
         if clip_decision(&message) {
             self.refresh_system_cursor_clip();
         }
+        self.refresh_local_notification_center_state();
         self.adapter.inbound(peer, message);
     }
     pub(super) fn cursor_resume(&mut self) {
@@ -168,6 +169,7 @@ impl Driver {
             // normally, without adopting the sample or scheduling another read.
             self.input_time = pending.time;
             self.input_report = pending.report;
+            self.refresh_local_notification_center_state();
             self.adapter.inbound(pending.peer, pending.message);
             self.outputs(pending.source);
             if let Some((source, time, arrived, lossy)) = pending.arrival {
@@ -188,6 +190,7 @@ impl Driver {
             // from today's predicted state and let later input follow in FIFO.
             self.input_time = pending.time;
             self.input_report = pending.report;
+            self.refresh_local_notification_center_state();
             self.adapter.inbound(pending.peer, pending.message);
             self.outputs(pending.source);
             if let Some((source, time, arrived, lossy)) = pending.arrival {
@@ -267,6 +270,7 @@ impl Driver {
         // remains the sole authority for gain, gap, resistance, drag and crossing.
         self.input_time = pending.time;
         self.input_report = pending.report;
+        self.refresh_local_notification_center_state();
         self.adapter.inbound(pending.peer, pending.message);
         self.outputs(pending.source);
         if let Some((source, time, arrived, lossy)) = pending.arrival {

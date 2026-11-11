@@ -214,6 +214,69 @@ pub enum SwipeAxis {
     Pinch,
 }
 
+/// Local-only snapshot of the macOS Notification Center panel. This is deliberately
+/// not serializable: panel visibility is runtime state and is never sent over the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationCenterPanelState {
+    Open,
+    Closed,
+    #[default]
+    Unknown,
+}
+
+/// Candidate type-31 fields captured from a native Notification Center gesture.
+/// Motion 1 is used for the observed native close lifecycle; other field semantics
+/// remain opaque and are not interpreted by routing.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NotificationCenterNativeFields {
+    pub motion: i64,
+    pub flavor: i64,
+    pub swipe_phase: i64,
+    pub progress: f64,
+    pub progress_f32_bits: i64,
+    pub gesture_progress: f64,
+    pub inverted_from_device: i64,
+    /// Opaque type-31 candidate fields 129 and 130, retained for QA replay.
+    pub raw_field_129: f64,
+    pub raw_field_130: f64,
+}
+
+impl NotificationCenterNativeFields {
+    /// Validate the narrow set of observed type-31 candidates before they cross or replay.
+    pub fn is_valid_native_candidate(self) -> bool {
+        matches!(self.motion, 1 | 9)
+            && matches!(self.flavor, 1 | 2)
+            && matches!(self.swipe_phase, 1 | 2 | 4 | 8)
+            && self.progress.is_finite()
+            && self.gesture_progress.is_finite()
+            && self.raw_field_129.is_finite()
+            && self.raw_field_130.is_finite()
+    }
+
+    pub fn is_valid_for_phase(self, phase: GesturePhase) -> bool {
+        self.is_valid_native_candidate() && self.swipe_phase == Self::phase_bits(phase)
+    }
+
+    const fn phase_bits(phase: GesturePhase) -> i64 {
+        match phase {
+            GesturePhase::Began => 1,
+            GesturePhase::Changed => 2,
+            GesturePhase::Ended => 4,
+            GesturePhase::Cancelled => 8,
+        }
+    }
+
+    pub const fn with_phase(mut self, phase: GesturePhase) -> Self {
+        self.swipe_phase = match phase {
+            GesturePhase::Began => 1,
+            GesturePhase::Changed => 2,
+            GesturePhase::Ended => 4,
+            GesturePhase::Cancelled => 8,
+        };
+        self
+    }
+}
+
 /// 触摸板手势。macOS 源机截获系统已识别好的手势，目标是 Mac 时原样重放
 /// （跟手的交互式进度），目标是 Windows 时映射为快捷键（任务视图、切换桌面、显示桌面、Ctrl+滚轮）。
 /// 两指滚动与两指轻扫返回不在这里，走带阶段的 [`InputEvent::Scroll`]。
@@ -234,13 +297,24 @@ pub enum Gesture {
     Rotate { phase: GesturePhase, degrees: f64 },
     /// 智能缩放（两指轻点两下）。
     SmartMagnify,
+    /// Explicit system action recognized from a right-edge fluid-touch gesture.
+    /// The phase preserves gesture-start target locking. Valid native metadata is replayed
+    /// as captured; phase-only peers retain the established system-shortcut fallback.
+    NotificationCenter {
+        phase: GesturePhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native: Option<NotificationCenterNativeFields>,
+    },
 }
 
 impl Gesture {
     /// 手势阶段；智能缩放是一次性的，为 `None`。
     pub const fn phase(&self) -> Option<GesturePhase> {
         match self {
-            Self::DockSwipe { phase, .. } | Self::Magnify { phase, .. } | Self::Rotate { phase, .. } => Some(*phase),
+            Self::DockSwipe { phase, .. }
+            | Self::Magnify { phase, .. }
+            | Self::Rotate { phase, .. }
+            | Self::NotificationCenter { phase, .. } => Some(*phase),
             Self::SmartMagnify => None,
         }
     }
@@ -325,6 +399,8 @@ pub enum InjectEvent {
     },
     /// 触摸板手势（追加的变体）：macOS 重放，Windows 映射为快捷键，做不了的丢弃。
     Gesture(Gesture),
+    /// Invoke the native Notification Center shortcut on macOS; never a generic key.
+    NotificationCenter,
     /// Relative device counts; no layout or screen scaling.
     MoveRelative {
         dx: f64,

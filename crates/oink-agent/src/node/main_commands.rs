@@ -111,6 +111,13 @@ impl Node {
                 }
                 return;
             }
+            if let Some(gesture_tap) = record.gesture_tap {
+                if let Some(diagnostics) = diagnostics {
+                    let event = crate::diagnostics::contacts::gesture_tap(gesture_tap);
+                    diagnostics.recorder.record_native(record.stamp, event);
+                }
+                return;
+            }
             if let Some(accounting) = record.pointer {
                 if let Some(diagnostics) = diagnostics {
                     let event = crate::diagnostics::Event::PointerTransition {

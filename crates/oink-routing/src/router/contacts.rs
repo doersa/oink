@@ -545,6 +545,7 @@ fn trace_route(
                 Gesture::Magnify { phase, .. } => (3, phase),
                 Gesture::Rotate { phase, .. } => (4, phase),
                 Gesture::SmartMagnify => (5, oink_foundation::input::GesturePhase::Ended),
+                Gesture::NotificationCenter { phase, .. } => (6, phase),
             };
             (2, kind, phase as u8)
         }
@@ -864,7 +865,7 @@ impl Router {
                     phase: GesturePhase::Cancelled,
                     degrees: 0.,
                 },
-                Gesture::SmartMagnify => continue,
+                Gesture::SmartMagnify | Gesture::NotificationCenter { .. } => continue,
             };
             self.out.push(Output::Inject(InjectEvent::Gesture(cancel)));
         }

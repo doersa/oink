@@ -2373,6 +2373,59 @@ unsafe extern "C-unwind" fn callback(
     }
     let owner = if swallow { "swallow" } else { "pass" };
     trace_gesture_delivery(ty, ev, owner, Some(disposition), remote);
+    if (29..=32).contains(&ty.0) && crate::native_lifecycle::lifecycle_enabled() {
+        let at_us = now_event_ns() / 1_000;
+        let int = |field| CGEvent::integer_value_field(Some(ev), CGEventField(field));
+        let phase = int(132);
+        let swipe_phase = int(134);
+        let boundary = matches!(phase, 1 | 4 | 8) || matches!(swipe_phase, 1 | 4 | 8);
+        // Never wait on the callback for a diagnostic sample. Gesture lifecycle
+        // bookkeeping can hold this mutex while formatting a boundary trace.
+        let suppressed = match s.gestures.try_lock() {
+            Ok(mut tracker) => tracker.sample_raw_tap(at_us, boundary),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().sample_raw_tap(at_us, boundary),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(suppressed) = suppressed {
+            let dbl = |field| CGEvent::double_value_field(Some(ev), CGEventField(field));
+            let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
+            let parsed_kind = match t.event.as_ref().map(|event| &event.event) {
+                Some(InputEvent::Gesture(oink_foundation::input::Gesture::DockSwipe { .. })) => 1,
+                Some(InputEvent::Gesture(oink_foundation::input::Gesture::Magnify { .. })) => 2,
+                Some(InputEvent::Gesture(oink_foundation::input::Gesture::Rotate { .. })) => 3,
+                Some(InputEvent::Gesture(oink_foundation::input::Gesture::SmartMagnify)) => 4,
+                Some(InputEvent::Gesture(oink_foundation::input::Gesture::NotificationCenter { .. })) => 5,
+                _ => 0,
+            };
+            crate::native_lifecycle::emit_gesture_tap(crate::native_lifecycle::GestureTapObservation {
+                event_type: ty.0,
+                event_type_field: int(55),
+                hid_type: int(110),
+                phase,
+                swipe_phase,
+                motion: int(123),
+                progress: finite(dbl(124)),
+                raw_field_129: finite(dbl(129)),
+                raw_field_130: finite(dbl(130)),
+                magnification: finite(dbl(113)),
+                rotation: finite(dbl(114)),
+                preflight: int(111),
+                series_type: int(117),
+                flavor: int(138),
+                gesture_progress: finite(dbl(142)),
+                gesture_stage: int(143),
+                gesture_behavior: int(144),
+                inverted_from_device: int(136),
+                parsed_kind,
+                physical,
+                own: user_data == MAGIC,
+                remote,
+                passed: !swallow,
+                native_timestamp_us: CGEvent::timestamp(Some(ev)) / 1_000,
+                suppressed,
+            });
+        }
+    }
     if let Some(CapturedEvent {
         event: InputEvent::Gesture(g),
         ..
@@ -2532,8 +2585,6 @@ fn trace_gesture_delivery(
         ?disposition,
         remote,
         timestamp_ns = CGEvent::timestamp(Some(ev)),
-        source_pid = CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUnixProcessID),
-        user_data = CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUserData),
         hid_type = field(110),
         phase = field(132),
         swipe_phase = field(134),
@@ -2924,7 +2975,11 @@ fn translate(ty: CGEventType, ev: &CGEvent) -> Translated {
 
     // 手势：Dock 轻扫、捏合、旋转、智能缩放翻译成 `Gesture`；其余（只携带触点的手势事件、
     // Dock 轻扫的伴随事件、轻扫、开始 / 结束手势）不上报。Remote 模式下一律吞掉（`pointer`）。
-    let gesture = sysevent::parse_gesture(ty.0, |f| int(CGEventField(f)), |f| dbl(CGEventField(f)));
+    let is_untrusted_fluid_gesture = ty.0 == sysevent::TYPE_FLUID_TOUCH_GESTURE
+        && (int(CGEventField::EventSourceUnixProcessID) != 0 || marked_own_event(ev));
+    let gesture = (!is_untrusted_fluid_gesture)
+        .then(|| sysevent::parse_gesture(ty.0, |f| int(CGEventField(f)), |f| dbl(CGEventField(f))))
+        .flatten();
     if let Some(g) = gesture {
         tracing::trace!(
             ?g,
@@ -3055,6 +3110,22 @@ mod tests {
         assert!(pointer_swallow(false, true, true, true));
         assert!(pointer_swallow(true, false, true, false));
         assert!(!pointer_swallow(false, true, false, true));
+    }
+
+    #[test]
+    fn marked_native_type31_candidate_is_not_translated_back_into_a_gesture() {
+        let event = CGEvent::new(None).unwrap();
+        CGEvent::set_type(Some(&event), CGEventType(sysevent::TYPE_FLUID_TOUCH_GESTURE));
+        for (field, value) in [(55, 31), (110, 27), (123, 9), (132, 4), (138, 1)] {
+            CGEvent::set_integer_value_field(Some(&event), CGEventField(field), value);
+        }
+        CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, MAGIC);
+        assert!(marked_own_event(&event));
+        assert!(
+            translate(CGEventType(sysevent::TYPE_FLUID_TOUCH_GESTURE), &event)
+                .event
+                .is_none()
+        );
     }
 
     #[test]

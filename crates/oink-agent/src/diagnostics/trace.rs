@@ -21,7 +21,7 @@ pub(super) fn register(r: &Recorder) {
     registry.recorders.store(Arc::new(rs));
 }
 pub(crate) struct DiagnosticsLayer;
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Scalars(
     Vec<(String, f64)>,
     Vec<(String, String)>,
@@ -545,6 +545,24 @@ impl Scalars {
                     | "wait_inbound"
                     | "wait_release"
             )
+        } else if self.2 == "oink_notification_center_scroll_diagnostics" {
+            matches!(
+                f.name(),
+                "scroll_close_state"
+                    | "scroll_close_natural"
+                    | "scroll_close_touchpad_source"
+                    | "scroll_close_unit"
+                    | "scroll_close_phase"
+                    | "scroll_close_wheel_steps"
+                    | "scroll_close_eligible"
+                    | "scroll_close_dx"
+                    | "scroll_close_dy"
+                    | "scroll_close_total_x"
+                    | "scroll_close_total_y"
+                    | "scroll_close_progress"
+                    | "scroll_close_pending_age_us"
+                    | "scroll_close_pending_frames"
+            )
         } else if bundle_only_target(self.2) {
             matches!(
                 f.name(),
@@ -683,6 +701,12 @@ impl Visit for Scalars {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
+        if self.4 == "oink_notification_center_probe" {
+            if field.name() == "state" && matches!(value, "open" | "closed" | "unknown") && self.1.len() < 8 {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
         if self.4 == "oink_arrangement" {
             let permitted = match field.name() {
                 "call_site" => matches!(value, "startup" | "observer"),
@@ -968,6 +992,43 @@ impl Visit for Scalars {
         {
             self.1.push((field.name().into(), value.into()));
         }
+        if self.2 == "oink_notification_center_scroll_diagnostics" {
+            let safe = match field.name() {
+                "kind" => value == "scroll_close",
+                "scroll_close_decision" => matches!(
+                    value,
+                    "ordinary"
+                        | "pending"
+                        | "native_started"
+                        | "native_ended"
+                        | "native_cancelled"
+                        | "native_interrupted"
+                ),
+                "scroll_close_reason" => matches!(
+                    value,
+                    "not_macos"
+                        | "panel_not_open"
+                        | "source_not_touchpad"
+                        | "wheel_steps_present"
+                        | "unsupported_unit"
+                        | "nonfinite_delta"
+                        | "closeward_horizontal"
+                        | "not_closeward_horizontal"
+                        | "axis_ambiguous"
+                        | "incompatible_scroll"
+                        | "scroll_cancelled"
+                        | "ambiguous_ended"
+                        | "pending_frame_limit"
+                        | "gesture_ended"
+                        | "momentum_interrupted"
+                ),
+                _ => false,
+            };
+            if safe && self.1.len() < 8 {
+                self.1.push((field.name().into(), value.into()));
+            }
+            return;
+        }
         if bundle_only_target(self.2) {
             let safe = match field.name() {
                 "kind" => matches!(
@@ -1110,6 +1171,7 @@ pub(crate) fn bundle_only_target(target: &str) -> bool {
             | "oink_auto_unlock_diagnostics"
             | "oink_windows_external_input"
             | "oink_touchpad_diagnostics"
+            | "oink_notification_center_scroll_diagnostics"
     )
 }
 fn safe_os_version(module: &str, value: &str) -> bool {
@@ -1406,6 +1468,57 @@ mod tests {
             event.record(&mut values);
             lock(&self.0).push(values);
         }
+    }
+
+    #[test]
+    fn notification_center_scroll_diagnostics_keep_only_reviewed_routing_metadata() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "oink_notification_center_scroll_diagnostics",
+                kind = "scroll_close",
+                scroll_close_decision = "native_started",
+                scroll_close_reason = "closeward_horizontal",
+                scroll_close_state = 2_u8,
+                scroll_close_natural = true,
+                scroll_close_touchpad_source = true,
+                scroll_close_unit = 0_u8,
+                scroll_close_phase = 2_u8,
+                scroll_close_wheel_steps = false,
+                scroll_close_eligible = true,
+                scroll_close_dx = 0.25_f64,
+                scroll_close_dy = 0.0_f64,
+                scroll_close_total_x = 0.25_f64,
+                scroll_close_total_y = 0.0_f64,
+                scroll_close_progress = 0.005208333_f64,
+                scroll_close_pending_age_us = 300001_u64,
+                scroll_close_pending_frames = 2_u64,
+                origin = "PRIVATE-DEVICE",
+                path = "/PRIVATE/PATH",
+                "PRIVATE-MESSAGE"
+            );
+        });
+        let rows = lock(&rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0.len(),
+            14,
+            "only reviewed routing counters and gesture values should survive"
+        );
+        assert!(rows[0].0.contains(&("scroll_close_state".into(), 2.0)));
+        assert!(rows[0].0.contains(&("scroll_close_dx".into(), 0.25)));
+        assert_eq!(
+            rows[0].1,
+            [
+                ("kind".into(), "scroll_close".into()),
+                ("scroll_close_decision".into(), "native_started".into()),
+                ("scroll_close_reason".into(), "closeward_horizontal".into()),
+            ]
+        );
+        let serialized = format!("{:?}", rows[0]);
+        assert!(!serialized.contains("PRIVATE"));
+        assert!(!serialized.contains("PATH"));
     }
     #[test]
     fn microphone_repair_keeps_class_reason_and_pseudonym_without_native_identity() {
@@ -2368,6 +2481,30 @@ mod tests {
         assert!(rows[1].0.is_empty());
         assert!(rows[1].1.is_empty());
     }
+    #[test]
+    fn notification_center_probe_exports_only_the_tri_state() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(rows.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "oink_notification_center_probe", state = "open", attribute = "AXFocusedWindow");
+            tracing::info!(target: "oink_notification_center_probe", state = "closed", window_title = "PRIVATE");
+            tracing::info!(target: "oink_notification_center_probe", state = "unknown", error = "PRIVATE");
+            tracing::info!(target: "oink_notification_center_probe", state = "private value", content = "PRIVATE");
+        });
+        let rows = lock(&rows);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter().map(|row| row.1.clone()).collect::<Vec<_>>(),
+            [
+                vec![("state".into(), "open".into())],
+                vec![("state".into(), "closed".into())],
+                vec![("state".into(), "unknown".into())],
+                Vec::new(),
+            ]
+        );
+        assert!(rows.iter().all(|row| row.0.is_empty()));
+    }
+
     #[test]
     fn keyboard_state_and_anomaly_projection_have_no_free_form_fields() {
         for (name, kind) in [

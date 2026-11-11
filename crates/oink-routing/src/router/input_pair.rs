@@ -112,6 +112,7 @@ impl Router {
         state.connected = false;
         self.windows_lock.capable.remove(&peer);
         state.touchpad_contacts = None;
+        state.notification_center_actions = false;
         state.focus_ready = false;
         if self.contacts_target == Some(peer) {
             self.cancel_source_contacts();
@@ -140,6 +141,7 @@ impl Router {
             Message::Control(ControlMsg::InputCapability {
                 controllable,
                 touchpad_contacts: self.touchpad_contacts,
+                notification_center_actions: self.cfg.os == Os::MacOS,
             }),
             Message::Control(ControlMsg::Feel {
                 profile: self.feel.clone(),
@@ -162,6 +164,11 @@ impl Router {
     pub fn set_peer_os(&mut self, peer: DeviceId, os: Os, now: Micros) {
         self.peers.entry(peer).or_insert_with(|| Peer::new(now)).os = os;
         self.refresh_windows_locks();
+    }
+    pub fn set_peer_notification_center_actions(&mut self, peer: DeviceId, supported: bool) {
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.notification_center_actions = supported && state.os == Os::MacOS;
+        }
     }
     /// Display facts are metadata only; topology arrives already compiled by config.
     pub fn set_peer_displays(&mut self, peer: DeviceId, displays: Vec<DisplayInfo>) {

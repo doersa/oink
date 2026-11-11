@@ -8,7 +8,8 @@ use std::sync::Arc;
 use oink_foundation::Point;
 pub use oink_foundation::input::{
     CaptureMode, CapturedEvent, Disposition, FeelProfile, Gesture, GesturePhase, InjectEvent, InputEvent,
-    InputPermissions, KeyCode, MouseButton, PermissionState, ScrollPhase, ScrollUnit, SourceKind, SwipeAxis,
+    InputPermissions, KeyCode, MouseButton, NotificationCenterPanelState, PermissionState, ScrollPhase, ScrollUnit,
+    SourceKind, SwipeAxis,
 };
 
 pub mod capture_continuity;
@@ -170,6 +171,11 @@ pub trait InputBackend: Send + Sync {
     }
     /// Runs after finite held-input cleanup, before that worker exits.
     fn stop_injection_session(&self) {}
+    /// Fresh, cached local Notification Center state. Implementations must not query
+    /// Accessibility or any other OS API in this accessor; unavailable/stale is Unknown.
+    fn notification_center_panel_state(&self) -> NotificationCenterPanelState {
+        NotificationCenterPanelState::Unknown
+    }
     /// Ordinary-thread observation of the current injection target. None keeps
     /// the existing permission-only policy; false withdraws controllability
     /// without claiming the network connection is offline.

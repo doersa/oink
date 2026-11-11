@@ -26,6 +26,7 @@ mod gesture_diagnostics;
 mod idle_pulse;
 mod inject;
 mod keyboard_diagnostics;
+mod notification_center_state;
 use crate::mac_keymap as keymap;
 mod loop_timer;
 mod main_queue;
@@ -79,6 +80,7 @@ pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
     let _ = system::secure_input_active();
     let safety = std::sync::Arc::new(crate::session_gate::SessionGate::default());
     let injector = inject::Injector::new(safety.clone())?;
+    notification_center_state::start_sampler();
     Ok(Box::new(MacInput {
         safety,
         tap: Mutex::new(None),
@@ -93,8 +95,16 @@ struct MacInput {
 }
 
 impl InputBackend for MacInput {
+    fn start_injection_session(&self) -> Result<(), InputError> {
+        notification_center_state::set_injection_session_active(true);
+        Ok(())
+    }
     fn stop_injection_session(&self) {
+        notification_center_state::set_injection_session_active(false);
         self.injector.stop_session();
+    }
+    fn notification_center_panel_state(&self) -> oink_foundation::input::NotificationCenterPanelState {
+        notification_center_state::current_state()
     }
     fn set_input_paused(&self, paused: bool) {
         self.safety.set_paused(paused);

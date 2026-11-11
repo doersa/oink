@@ -15,7 +15,8 @@ use crate::input::{InputMsg, ScrollAmount};
 use oink_foundation::display::DisplayInfo;
 use oink_foundation::input::{
     CaptureMode, CapturedEvent, Disposition, FeelProfile, Gesture, GesturePhase, InjectEvent, InputEvent, InputMode,
-    KeyCode, MouseButton, ScrollPhase, ScrollUnit, SourceKind,
+    KeyCode, MouseButton, NotificationCenterNativeFields, NotificationCenterPanelState, ScrollPhase, ScrollUnit,
+    SourceKind,
 };
 use oink_foundation::{DeviceId, Point, Rect};
 
@@ -28,6 +29,18 @@ use crate::layout::{LayoutQuery, ScreenId, ScreenPos};
 const SCROLL_PIXELS_PER_LINE: f64 = 32.0;
 const LEGACY_SCROLL_REFERENCE_PER_PIXEL: f64 = 0.25 / 686.0;
 
+fn cancelled_native_notification_center(gesture: Gesture) -> Option<Gesture> {
+    match gesture {
+        Gesture::NotificationCenter {
+            phase,
+            native: Some(fields),
+        } if fields.is_valid_for_phase(phase) => Some(Gesture::NotificationCenter {
+            phase: GesturePhase::Cancelled,
+            native: Some(fields.with_phase(GesturePhase::Cancelled)),
+        }),
+        _ => None,
+    }
+}
 #[cfg(test)]
 mod activity_tests;
 mod caps;
@@ -384,6 +397,39 @@ impl<T: Copy> ScrollRoute<T> {
     }
 }
 
+const SCROLL_CLOSE_PROGRESS_PIXELS: f64 = 48.0;
+const SCROLL_CLOSE_MAX_PENDING_FRAMES: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct BufferedScroll {
+    dx: f64,
+    dy: f64,
+    unit: ScrollAmount,
+    phase: ScrollPhase,
+    wheel_steps: Option<Point>,
+}
+
+#[derive(Clone, Debug)]
+enum ScrollCloseRoute {
+    /// Retain a short ordinary-scroll fallback while tracking a tentative native lifecycle.
+    Pending {
+        frames: Vec<BufferedScroll>,
+        total_x: f64,
+        total_y: f64,
+        natural_scroll_touchpad: bool,
+        started_at: Micros,
+        hops: u8,
+    },
+    /// This finger/momentum sequence was intentionally left as ordinary scrolling.
+    Ordinary,
+    /// A synthetic type-31 lifecycle is active for this scroll sequence.
+    Native {
+        progress: f64,
+        hops: u8,
+        natural_scroll_touchpad: bool,
+    },
+}
+
 /// 源端：一个按下的键 / 按钮发往了哪里（按下时的目标即抬起时的目标）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Target {
@@ -410,6 +456,7 @@ struct Peer {
     /// Negotiated `oink.pointer.move-hidden/1`: accepts explicit hidden-screen entry.
     pointer_move_hidden: bool,
     local_click: bool,
+    notification_center_actions: bool,
     connected: bool,
     name: String,
     os: Os,
@@ -433,6 +480,7 @@ impl Peer {
             scroll_pixels: false,
             pointer_move_hidden: false,
             local_click: false,
+            notification_center_actions: false,
             connected: false,
             name: String::new(),
             os: Os::Other,
@@ -587,6 +635,8 @@ pub struct Router {
     fn_sync_held: bool,
 
     // ---- 目标端 ----
+    /// Cached, freshness-checked local platform observation; never received over the wire.
+    local_notification_center_state: NotificationCenterPanelState,
     held: HashMap<DeviceId, OriginHeld>,
     key_refs: HashMap<KeyCode, u32>,
     input_transforms: HashMap<DeviceId, oink_foundation::input_transform::InputTransform>,
@@ -601,6 +651,10 @@ pub struct Router {
     forwarded_sync: HashSet<(DeviceId, DeviceId)>,
     /// 已开始且焦点未变化的滚动：源 → 实际接收端（包括本机）；换焦点即清空。
     scroll_fwd: HashMap<DeviceId, ScrollRoute<DeviceId>>,
+    /// Target-local Notification Center close conversion state per remote input origin.
+    scroll_close: HashMap<DeviceId, ScrollCloseRoute>,
+    /// Keep momentum from an already-converted scroll from reaching the app below the panel.
+    scroll_close_suppressed_momentum: HashSet<DeviceId>,
     /// 触摸板 Gesture 仍保留原始转发目标，不采用滚动的丢弃规则。
     gesture_fwd: HashMap<DeviceId, DeviceId>,
     /// 为某个源注入、还没结束的手势（源断线时补一个取消，Dock 不会停在半途）。
@@ -724,6 +778,7 @@ impl Router {
             caps_press: None,
             mac_caps_switch: false,
             fn_sync_held: false,
+            local_notification_center_state: NotificationCenterPanelState::Unknown,
             held: HashMap::new(),
             key_refs: HashMap::new(),
             input_transforms: HashMap::new(),
@@ -734,6 +789,8 @@ impl Router {
             press_routes: HashMap::new(),
             forwarded_sync: HashSet::new(),
             scroll_fwd: HashMap::new(),
+            scroll_close: HashMap::new(),
+            scroll_close_suppressed_momentum: HashSet::new(),
             gesture_fwd: HashMap::new(),
             gesture_active: HashMap::new(),
             touchpad_contacts: None,
@@ -762,6 +819,12 @@ impl Router {
     /// 本次路由进程实例，用于诊断与显式构造测试移交；重连时不变。
     pub fn routing_session(&self) -> [u8; 16] {
         self.session
+    }
+
+    /// Install a cached local platform observation before processing inbound input.
+    /// The caller is responsible for freshness; the router never queries the OS.
+    pub fn set_local_notification_center_state(&mut self, state: NotificationCenterPanelState) {
+        self.local_notification_center_state = state;
     }
 
     pub fn device(&self) -> DeviceId {
@@ -1104,6 +1167,9 @@ impl Router {
         if self.paused == paused {
             return;
         }
+        if paused {
+            self.cancel_scroll_close_routes();
+        }
         if paused && self.locked_device() == Some(self.me()) {
             self.end_focus_lock();
         }
@@ -1157,6 +1223,7 @@ impl Router {
         self.keyboard.cancel_release_hold();
         self.set_paused(paused);
         if paused {
+            self.cancel_scroll_close_routes();
             self.release_local_transformed();
             self.dnd_abort("device paused");
             let origins: std::collections::HashSet<_> =
@@ -2440,7 +2507,14 @@ impl Router {
             Target::Local => Disposition::Pass,
             Target::Remote(d) => {
                 if self.cfg.settings.forward_gestures {
-                    self.send(d, Message::Input(InputMsg::Gesture { source, gesture }));
+                    let supported = !matches!(gesture, Gesture::NotificationCenter { .. })
+                        || self
+                            .peers
+                            .get(&d)
+                            .is_some_and(|peer| peer.notification_center_actions && peer.os == Os::MacOS);
+                    if supported {
+                        self.send(d, Message::Input(InputMsg::Gesture { source, gesture }));
+                    }
                 }
                 // 关闭转发时照样吞掉：焦点在其他设备上，本机不响应手势（开关之前的行为）。
                 Disposition::Swallow
@@ -3052,6 +3126,19 @@ impl Router {
                 {
                     return;
                 }
+                if self.route_notification_center_close_scroll(
+                    origin,
+                    hops,
+                    source,
+                    dx,
+                    dy,
+                    unit,
+                    phase,
+                    wheel_steps,
+                    now,
+                ) {
+                    return;
+                }
                 self.inject_scroll(origin, source, dx, dy, unit, phase, wheel_steps);
             }
             InputMsg::HeldSync { keys, buttons } => self.held_sync(from, origin, &keys, &buttons),
@@ -3200,6 +3287,79 @@ impl Router {
             .push(Output::Inject(self.native_key_event(origin, mapped, true)));
     }
 
+    fn remote_notification_center_native_close(
+        &mut self,
+        origin: DeviceId,
+        phase: GesturePhase,
+        native: Option<NotificationCenterNativeFields>,
+    ) {
+        let active = self.gesture_active.get(&origin).copied();
+        let active_close = matches!(
+            active,
+            Some(Gesture::NotificationCenter {
+                phase: active_phase,
+                native: Some(fields),
+            }) if fields.motion == 1 && fields.is_valid_for_phase(active_phase)
+        );
+        let valid = native.is_some_and(|fields| fields.motion == 1 && fields.is_valid_for_phase(phase));
+        let gesture = valid.then_some(Gesture::NotificationCenter { phase, native });
+        match phase {
+            GesturePhase::Began => {
+                if active_close
+                    && let Some(Gesture::NotificationCenter {
+                        native: Some(fields), ..
+                    }) = active
+                {
+                    let cancelled = Gesture::NotificationCenter {
+                        phase: GesturePhase::Cancelled,
+                        native: Some(fields.with_phase(GesturePhase::Cancelled)),
+                    };
+                    self.out.push(Output::Inject(InjectEvent::Gesture(cancelled)));
+                }
+                self.gesture_active.remove(&origin);
+                if let Some(gesture) = gesture {
+                    self.gesture_active.insert(origin, gesture);
+                    self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                }
+            }
+            GesturePhase::Changed => {
+                if active_close {
+                    if let Some(gesture) = gesture {
+                        self.gesture_active.insert(origin, gesture);
+                        self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                    } else if let Some(Gesture::NotificationCenter {
+                        native: Some(fields), ..
+                    }) = active
+                    {
+                        self.gesture_active.remove(&origin);
+                        self.out
+                            .push(Output::Inject(InjectEvent::Gesture(Gesture::NotificationCenter {
+                                phase: GesturePhase::Cancelled,
+                                native: Some(fields.with_phase(GesturePhase::Cancelled)),
+                            })));
+                    }
+                }
+            }
+            GesturePhase::Ended | GesturePhase::Cancelled => {
+                self.gesture_active.remove(&origin);
+                if active_close {
+                    if let Some(gesture) = gesture {
+                        self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                    } else if let Some(Gesture::NotificationCenter {
+                        native: Some(fields), ..
+                    }) = active
+                    {
+                        self.out
+                            .push(Output::Inject(InjectEvent::Gesture(Gesture::NotificationCenter {
+                                phase: GesturePhase::Cancelled,
+                                native: Some(fields.with_phase(GesturePhase::Cancelled)),
+                            })));
+                    }
+                }
+            }
+        }
+    }
+
     /// 源机的触摸板 Gesture 到达目标端：开始时转发出去的，后续阶段仍跟着转发；
     /// 源机锁定目标后发来的后续阶段，即使本机已不是焦点机也在本机注入。
     fn remote_gesture(&mut self, origin: DeviceId, hops: u8, gesture: Gesture, msg: InputMsg) {
@@ -3221,12 +3381,121 @@ impl Router {
         if !continuing {
             self.gesture_fwd.remove(&origin);
             let dst = self.holder;
-            if dst != self.me() && self.forward(origin, hops, msg) {
-                if !gesture.ends() {
+            if dst != self.me() {
+                let supported = !matches!(gesture, Gesture::NotificationCenter { .. })
+                    || self
+                        .peers
+                        .get(&dst)
+                        .is_some_and(|peer| peer.notification_center_actions && peer.os == Os::MacOS);
+                if supported && self.forward(origin, hops, msg) && !gesture.ends() {
                     self.gesture_fwd.insert(origin, dst);
+                }
+                // A relay must never execute a system action on behalf of a different holder.
+                return;
+            }
+        }
+        if let Gesture::NotificationCenter { phase, native } = gesture {
+            if self.cfg.os == Os::MacOS && native.is_some_and(|fields| fields.motion == 1) {
+                if phase == GesturePhase::Began
+                    && self.local_notification_center_state != NotificationCenterPanelState::Open
+                {
+                    return;
+                }
+                self.remote_notification_center_native_close(origin, phase, native);
+                return;
+            }
+            if self.cfg.os == Os::MacOS {
+                let active = self.gesture_active.get(&origin).copied();
+                let active_native = matches!(
+                    active,
+                    Some(Gesture::NotificationCenter {
+                        phase: active_phase,
+                        native: Some(fields),
+                    }) if fields.is_valid_for_phase(active_phase)
+                );
+                match phase {
+                    GesturePhase::Began => {
+                        if active_native && let Some(previous) = active.and_then(cancelled_native_notification_center) {
+                            self.out.push(Output::Inject(InjectEvent::Gesture(previous)));
+                        }
+                        match native {
+                            Some(fields) if fields.is_valid_for_phase(phase) => {
+                                self.gesture_active.insert(origin, gesture);
+                                self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                            }
+                            None => {
+                                // Phase-only peers keep the established Ended-only Fn+N behavior.
+                                self.gesture_active.insert(origin, gesture);
+                            }
+                            Some(_) => {
+                                self.gesture_active.remove(&origin);
+                            }
+                        }
+                    }
+                    GesturePhase::Changed => {
+                        if matches!(active, Some(Gesture::NotificationCenter { native: None, .. })) {
+                            self.gesture_active
+                                .insert(origin, Gesture::NotificationCenter { phase, native: None });
+                        } else if active_native {
+                            if native.is_some_and(|fields| fields.is_valid_for_phase(phase)) {
+                                self.gesture_active.insert(origin, gesture);
+                                self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                            } else {
+                                self.gesture_active.remove(&origin);
+                                if let Some(previous) = active.and_then(cancelled_native_notification_center) {
+                                    self.out.push(Output::Inject(InjectEvent::Gesture(previous)));
+                                }
+                            }
+                        }
+                    }
+                    GesturePhase::Ended => {
+                        let active = self.gesture_active.remove(&origin);
+                        if active_native {
+                            if native.is_some_and(|fields| fields.is_valid_for_phase(phase)) {
+                                self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                            } else if let Some(previous) = active.and_then(cancelled_native_notification_center) {
+                                self.out.push(Output::Inject(InjectEvent::Gesture(previous)));
+                            }
+                        } else if matches!(active, Some(Gesture::NotificationCenter { native: None, .. })) {
+                            self.out.push(Output::Inject(InjectEvent::NotificationCenter));
+                        }
+                    }
+                    GesturePhase::Cancelled => {
+                        let active = self.gesture_active.remove(&origin);
+                        if active_native {
+                            if native.is_some_and(|fields| fields.is_valid_for_phase(phase)) {
+                                self.out.push(Output::Inject(InjectEvent::Gesture(gesture)));
+                            } else if let Some(previous) = active.and_then(cancelled_native_notification_center) {
+                                self.out.push(Output::Inject(InjectEvent::Gesture(previous)));
+                            }
+                        }
+                    }
                 }
                 return;
             }
+            match phase {
+                GesturePhase::Began => {
+                    self.gesture_active.insert(origin, gesture);
+                }
+                GesturePhase::Changed => {
+                    if matches!(
+                        self.gesture_active.get(&origin),
+                        Some(Gesture::NotificationCenter { .. })
+                    ) {
+                        self.gesture_active.insert(origin, gesture);
+                    }
+                }
+                GesturePhase::Ended => {
+                    let active = self.gesture_active.remove(&origin);
+                    if self.cfg.os == Os::MacOS && matches!(active, Some(Gesture::NotificationCenter { .. })) {
+                        self.out.push(Output::Inject(InjectEvent::NotificationCenter));
+                    }
+                }
+                GesturePhase::Cancelled => {
+                    self.gesture_active.remove(&origin);
+                }
+            }
+            return;
         }
         if !self.filter_multifinger(origin, contacts::MultiEvent::Gesture(gesture)) {
             return;
@@ -3357,6 +3626,720 @@ impl Router {
         // clipping only x/y here would turn a shallow diagonal into a kink.
         let trail_head = Point::new(from.local.x + delta.0, from.local.y + delta.1);
         self.hand_off(r.to, Some(trail_head));
+    }
+
+    fn scroll_close_delta(unit: ScrollAmount, dx: f64, dy: f64) -> Option<(f64, f64)> {
+        let scale = match unit {
+            ScrollAmount::Pixels => 1.0,
+            ScrollAmount::Reference => 1.0 / LEGACY_SCROLL_REFERENCE_PER_PIXEL,
+            ScrollAmount::Lines => return None,
+        };
+        let (dx, dy) = (dx * scale, dy * scale);
+        (dx.is_finite() && dy.is_finite()).then_some((dx, dy))
+    }
+
+    /// Some(true) is a closeward horizontal candidate; the sign depends on the
+    /// source's natural-scroll preference. Some(false) is clearly non-close input.
+    /// No absolute distance is required: horizontal dominance alone is enough to
+    /// let a slow or small swipe enter the native close phase.
+    fn scroll_close_direction(natural: bool, dx: f64, dy: f64) -> Option<bool> {
+        let (x, y) = (dx.abs(), dy.abs());
+        if x > 0.0 && x >= 2.0 * y {
+            // The shared view convention maps a physical rightward finger motion to
+            // positive dx when natural scrolling is enabled, and negative dx otherwise.
+            Some(if natural { dx > 0.0 } else { dx < 0.0 })
+        } else if y > 0.0 && y >= 2.0 * x {
+            Some(false)
+        } else {
+            // Keep diagonal/zero prefixes buffered until the axis is clear or the
+            // phase terminates; never guess closeward direction from noise.
+            None
+        }
+    }
+
+    fn scroll_close_progress(natural_scroll_touchpad: bool, dx: f64) -> f64 {
+        let closeward_delta = if natural_scroll_touchpad { dx } else { -dx };
+        (closeward_delta / SCROLL_CLOSE_PROGRESS_PIXELS).clamp(0.0, 1.0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_notification_center_scroll_close(
+        &self,
+        decision: &'static str,
+        reason: &'static str,
+        source: SourceKind,
+        unit: ScrollAmount,
+        phase: ScrollPhase,
+        wheel_steps: bool,
+        natural_scroll_touchpad: bool,
+        dx: f64,
+        dy: f64,
+        total_x: f64,
+        total_y: f64,
+        progress: f64,
+        pending_age_us: u64,
+        pending_frames: usize,
+        eligible: bool,
+    ) {
+        let state = match self.local_notification_center_state {
+            NotificationCenterPanelState::Unknown => 0_u8,
+            NotificationCenterPanelState::Closed => 1,
+            NotificationCenterPanelState::Open => 2,
+        };
+        let phase = match phase {
+            ScrollPhase::None => 0_u8,
+            ScrollPhase::Began => 1,
+            ScrollPhase::Changed => 2,
+            ScrollPhase::Ended => 3,
+            ScrollPhase::Cancelled => 4,
+            ScrollPhase::MomentumBegan => 5,
+            ScrollPhase::Momentum => 6,
+            ScrollPhase::MomentumEnded => 7,
+        };
+        let unit = match unit {
+            ScrollAmount::Pixels => 0_u8,
+            ScrollAmount::Reference => 1,
+            ScrollAmount::Lines => 2,
+        };
+        tracing::info!(
+            target: "oink_notification_center_scroll_diagnostics",
+            kind = "scroll_close",
+            scroll_close_decision = decision,
+            scroll_close_reason = reason,
+            scroll_close_state = state,
+            scroll_close_natural = natural_scroll_touchpad,
+            scroll_close_touchpad_source = source == SourceKind::Touchpad,
+            scroll_close_unit = unit,
+            scroll_close_phase = phase,
+            scroll_close_wheel_steps = wheel_steps,
+            scroll_close_eligible = eligible,
+            scroll_close_dx = dx,
+            scroll_close_dy = dy,
+            scroll_close_total_x = total_x,
+            scroll_close_total_y = total_y,
+            scroll_close_progress = progress,
+            scroll_close_pending_age_us = pending_age_us,
+            scroll_close_pending_frames = pending_frames as u64,
+            "notification-center scroll close routing"
+        );
+    }
+
+    fn notification_center_close_gesture(phase: GesturePhase, progress: f64) -> Gesture {
+        let progress = progress.clamp(0.0, 1.0);
+        let fields = NotificationCenterNativeFields {
+            motion: 1,
+            flavor: 1,
+            swipe_phase: 1,
+            progress,
+            progress_f32_bits: i64::from((progress as f32).to_bits()),
+            gesture_progress: 0.0,
+            inverted_from_device: 0,
+            raw_field_129: 0.0,
+            raw_field_130: 0.0,
+        }
+        .with_phase(phase);
+        Gesture::NotificationCenter {
+            phase,
+            native: Some(fields),
+        }
+    }
+
+    fn inject_notification_center_close_phase(
+        &mut self,
+        origin: DeviceId,
+        hops: u8,
+        phase: GesturePhase,
+        progress: f64,
+    ) {
+        let gesture = Self::notification_center_close_gesture(phase, progress);
+        self.remote_gesture(
+            origin,
+            hops,
+            gesture,
+            InputMsg::Gesture {
+                source: SourceKind::Touchpad,
+                gesture,
+            },
+        );
+    }
+
+    fn cancel_notification_center_close(&mut self, origin: DeviceId, progress: f64) {
+        self.gesture_active.remove(&origin);
+        self.out.push(Output::Inject(InjectEvent::Gesture(
+            Self::notification_center_close_gesture(GesturePhase::Cancelled, progress),
+        )));
+    }
+
+    fn inject_buffered_scroll(&mut self, origin: DeviceId, frame: BufferedScroll) {
+        self.inject_scroll(
+            origin,
+            SourceKind::Touchpad,
+            frame.dx,
+            frame.dy,
+            frame.unit,
+            frame.phase,
+            frame.wheel_steps,
+        );
+    }
+
+    fn flush_pending_scroll(&mut self, origin: DeviceId, frames: &[BufferedScroll]) {
+        for frame in frames.iter().copied() {
+            self.inject_buffered_scroll(origin, frame);
+        }
+    }
+
+    fn cancel_scroll_close_routes(&mut self) {
+        self.scroll_close_suppressed_momentum.clear();
+        let routes = std::mem::take(&mut self.scroll_close);
+        for (origin, route) in routes {
+            match route {
+                ScrollCloseRoute::Pending { .. } => {}
+                ScrollCloseRoute::Native { progress, .. } => {
+                    self.cancel_notification_center_close(origin, progress);
+                }
+                ScrollCloseRoute::Ordinary => {}
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn route_notification_center_close_scroll(
+        &mut self,
+        origin: DeviceId,
+        hops: u8,
+        source: SourceKind,
+        dx: f64,
+        dy: f64,
+        unit: ScrollAmount,
+        phase: ScrollPhase,
+        wheel_steps: Option<Point>,
+        now: Micros,
+    ) -> bool {
+        if phase == ScrollPhase::None {
+            return false;
+        }
+        if self.scroll_close_suppressed_momentum.contains(&origin)
+            && matches!(
+                phase,
+                ScrollPhase::MomentumBegan | ScrollPhase::Momentum | ScrollPhase::MomentumEnded
+            )
+        {
+            if phase == ScrollPhase::MomentumEnded {
+                self.scroll_close_suppressed_momentum.remove(&origin);
+            }
+            return true;
+        }
+        let frame = BufferedScroll {
+            dx,
+            dy,
+            unit,
+            phase,
+            wheel_steps,
+        };
+        if phase == ScrollPhase::Began {
+            if let Some(previous) = self.scroll_close.remove(&origin) {
+                match previous {
+                    ScrollCloseRoute::Pending { frames, .. } => {
+                        self.flush_pending_scroll(origin, &frames);
+                    }
+                    ScrollCloseRoute::Native { progress, .. } => {
+                        self.cancel_notification_center_close(origin, progress)
+                    }
+                    ScrollCloseRoute::Ordinary => {}
+                }
+            }
+            let natural_scroll_touchpad = self
+                .peers
+                .get(&origin)
+                .is_some_and(|peer| peer.feel.natural_scroll_touchpad);
+            let delta = Self::scroll_close_delta(unit, dx, dy);
+            let ineligible_reason = if self.cfg.os != Os::MacOS {
+                Some("not_macos")
+            } else if self.local_notification_center_state != NotificationCenterPanelState::Open {
+                Some("panel_not_open")
+            } else if source != SourceKind::Touchpad {
+                Some("source_not_touchpad")
+            } else if wheel_steps.is_some() {
+                Some("wheel_steps_present")
+            } else if !matches!(unit, ScrollAmount::Pixels | ScrollAmount::Reference) {
+                Some("unsupported_unit")
+            } else if delta.is_none() {
+                Some("nonfinite_delta")
+            } else {
+                None
+            };
+            if let Some(reason) = ineligible_reason {
+                self.trace_notification_center_scroll_close(
+                    "ordinary",
+                    reason,
+                    source,
+                    unit,
+                    phase,
+                    wheel_steps.is_some(),
+                    natural_scroll_touchpad,
+                    dx,
+                    dy,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0,
+                    1,
+                    false,
+                );
+                self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                return false;
+            }
+            let (total_x, total_y) = delta.expect("eligible finite scroll");
+            let frames = vec![frame];
+            match Self::scroll_close_direction(natural_scroll_touchpad, total_x, total_y) {
+                Some(true) => {
+                    let progress = Self::scroll_close_progress(natural_scroll_touchpad, total_x);
+                    self.trace_notification_center_scroll_close(
+                        "native_started",
+                        "closeward_horizontal",
+                        source,
+                        unit,
+                        phase,
+                        false,
+                        natural_scroll_touchpad,
+                        total_x,
+                        total_y,
+                        total_x,
+                        total_y,
+                        progress,
+                        0,
+                        1,
+                        true,
+                    );
+                    self.inject_notification_center_close_phase(origin, hops, GesturePhase::Began, 0.0);
+                    self.inject_notification_center_close_phase(origin, hops, GesturePhase::Changed, progress);
+                    self.scroll_close.insert(
+                        origin,
+                        ScrollCloseRoute::Native {
+                            progress,
+                            hops,
+                            natural_scroll_touchpad,
+                        },
+                    );
+                    true
+                }
+                Some(false) => {
+                    self.trace_notification_center_scroll_close(
+                        "ordinary",
+                        "not_closeward_horizontal",
+                        source,
+                        unit,
+                        phase,
+                        false,
+                        natural_scroll_touchpad,
+                        total_x,
+                        total_y,
+                        total_x,
+                        total_y,
+                        0.0,
+                        0,
+                        1,
+                        true,
+                    );
+                    self.flush_pending_scroll(origin, &frames);
+                    self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                    true
+                }
+                None => {
+                    self.trace_notification_center_scroll_close(
+                        "pending",
+                        "axis_ambiguous",
+                        source,
+                        unit,
+                        phase,
+                        false,
+                        natural_scroll_touchpad,
+                        total_x,
+                        total_y,
+                        total_x,
+                        total_y,
+                        0.0,
+                        0,
+                        1,
+                        true,
+                    );
+                    self.scroll_close.insert(
+                        origin,
+                        ScrollCloseRoute::Pending {
+                            frames,
+                            total_x,
+                            total_y,
+                            natural_scroll_touchpad,
+                            started_at: now,
+                            hops,
+                        },
+                    );
+                    true
+                }
+            }
+        } else {
+            let Some(route) = self.scroll_close.remove(&origin) else {
+                return false;
+            };
+            match route {
+                ScrollCloseRoute::Ordinary => {
+                    if !matches!(phase, ScrollPhase::Cancelled | ScrollPhase::MomentumEnded) {
+                        self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                    }
+                    false
+                }
+                ScrollCloseRoute::Pending {
+                    mut frames,
+                    mut total_x,
+                    mut total_y,
+                    natural_scroll_touchpad,
+                    started_at,
+                    hops: gesture_hops,
+                } => {
+                    let pending_age_us = now.saturating_sub(started_at);
+                    if self.local_notification_center_state != NotificationCenterPanelState::Open {
+                        self.trace_notification_center_scroll_close(
+                            "ordinary",
+                            "panel_not_open",
+                            source,
+                            unit,
+                            phase,
+                            wheel_steps.is_some(),
+                            natural_scroll_touchpad,
+                            dx,
+                            dy,
+                            total_x,
+                            total_y,
+                            0.0,
+                            pending_age_us,
+                            frames.len(),
+                            false,
+                        );
+                        self.flush_pending_scroll(origin, &frames);
+                        self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                        return false;
+                    }
+                    let compatible = source == SourceKind::Touchpad
+                        && wheel_steps.is_none()
+                        && unit == frames[0].unit
+                        && matches!(
+                            phase,
+                            ScrollPhase::Changed | ScrollPhase::Ended | ScrollPhase::Cancelled
+                        );
+                    if !compatible {
+                        self.trace_notification_center_scroll_close(
+                            "ordinary",
+                            "incompatible_scroll",
+                            source,
+                            unit,
+                            phase,
+                            wheel_steps.is_some(),
+                            natural_scroll_touchpad,
+                            dx,
+                            dy,
+                            total_x,
+                            total_y,
+                            0.0,
+                            pending_age_us,
+                            frames.len(),
+                            false,
+                        );
+                        self.flush_pending_scroll(origin, &frames);
+                        self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                        return false;
+                    }
+                    let Some((delta_x, delta_y)) = Self::scroll_close_delta(unit, dx, dy) else {
+                        self.trace_notification_center_scroll_close(
+                            "ordinary",
+                            "nonfinite_delta",
+                            source,
+                            unit,
+                            phase,
+                            wheel_steps.is_some(),
+                            natural_scroll_touchpad,
+                            dx,
+                            dy,
+                            total_x,
+                            total_y,
+                            0.0,
+                            pending_age_us,
+                            frames.len(),
+                            false,
+                        );
+                        self.flush_pending_scroll(origin, &frames);
+                        self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                        return false;
+                    };
+                    total_x += delta_x;
+                    total_y += delta_y;
+                    frames.push(frame);
+                    let frame_limit = frames.len() >= SCROLL_CLOSE_MAX_PENDING_FRAMES;
+                    let classify = if phase == ScrollPhase::Cancelled {
+                        Some(false)
+                    } else {
+                        Self::scroll_close_direction(natural_scroll_touchpad, total_x, total_y)
+                    };
+                    match classify {
+                        Some(true) if phase != ScrollPhase::Cancelled => {
+                            let progress = Self::scroll_close_progress(natural_scroll_touchpad, total_x);
+                            let decision = if phase == ScrollPhase::Ended {
+                                "native_ended"
+                            } else {
+                                "native_started"
+                            };
+                            self.trace_notification_center_scroll_close(
+                                decision,
+                                "closeward_horizontal",
+                                source,
+                                unit,
+                                phase,
+                                false,
+                                natural_scroll_touchpad,
+                                delta_x,
+                                delta_y,
+                                total_x,
+                                total_y,
+                                progress,
+                                pending_age_us,
+                                frames.len(),
+                                true,
+                            );
+                            self.inject_notification_center_close_phase(origin, gesture_hops, GesturePhase::Began, 0.0);
+                            self.inject_notification_center_close_phase(
+                                origin,
+                                gesture_hops,
+                                GesturePhase::Changed,
+                                progress,
+                            );
+                            if phase == ScrollPhase::Ended {
+                                self.inject_notification_center_close_phase(
+                                    origin,
+                                    gesture_hops,
+                                    GesturePhase::Ended,
+                                    progress,
+                                );
+                                self.scroll_close_suppressed_momentum.insert(origin);
+                            } else {
+                                self.scroll_close.insert(
+                                    origin,
+                                    ScrollCloseRoute::Native {
+                                        progress,
+                                        hops: gesture_hops,
+                                        natural_scroll_touchpad,
+                                    },
+                                );
+                            }
+                            true
+                        }
+                        Some(true) => unreachable!("cancelled scroll cannot classify as a close gesture"),
+                        Some(false) => {
+                            let reason = if phase == ScrollPhase::Cancelled {
+                                "scroll_cancelled"
+                            } else {
+                                "not_closeward_horizontal"
+                            };
+                            self.trace_notification_center_scroll_close(
+                                "ordinary",
+                                reason,
+                                source,
+                                unit,
+                                phase,
+                                false,
+                                natural_scroll_touchpad,
+                                delta_x,
+                                delta_y,
+                                total_x,
+                                total_y,
+                                0.0,
+                                pending_age_us,
+                                frames.len(),
+                                true,
+                            );
+                            self.flush_pending_scroll(origin, &frames);
+                            if phase != ScrollPhase::Cancelled {
+                                self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                            }
+                            true
+                        }
+                        None if frame_limit || matches!(phase, ScrollPhase::Ended | ScrollPhase::Cancelled) => {
+                            let reason = if phase == ScrollPhase::Cancelled {
+                                "scroll_cancelled"
+                            } else if phase == ScrollPhase::Ended {
+                                "ambiguous_ended"
+                            } else {
+                                "pending_frame_limit"
+                            };
+                            self.trace_notification_center_scroll_close(
+                                "ordinary",
+                                reason,
+                                source,
+                                unit,
+                                phase,
+                                false,
+                                natural_scroll_touchpad,
+                                delta_x,
+                                delta_y,
+                                total_x,
+                                total_y,
+                                0.0,
+                                pending_age_us,
+                                frames.len(),
+                                true,
+                            );
+                            self.flush_pending_scroll(origin, &frames);
+                            if phase != ScrollPhase::Cancelled {
+                                self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                            }
+                            true
+                        }
+                        None => {
+                            self.scroll_close.insert(
+                                origin,
+                                ScrollCloseRoute::Pending {
+                                    frames,
+                                    total_x,
+                                    total_y,
+                                    natural_scroll_touchpad,
+                                    started_at,
+                                    hops: gesture_hops,
+                                },
+                            );
+                            true
+                        }
+                    }
+                }
+                ScrollCloseRoute::Native {
+                    mut progress,
+                    hops: gesture_hops,
+                    natural_scroll_touchpad,
+                } => match phase {
+                    ScrollPhase::Changed => {
+                        let compatible = source == SourceKind::Touchpad
+                            && wheel_steps.is_none()
+                            && matches!(unit, ScrollAmount::Pixels | ScrollAmount::Reference);
+                        let Some((delta_x, _)) = Self::scroll_close_delta(unit, dx, dy).filter(|_| compatible) else {
+                            self.trace_notification_center_scroll_close(
+                                "native_interrupted",
+                                "incompatible_scroll",
+                                source,
+                                unit,
+                                phase,
+                                wheel_steps.is_some(),
+                                natural_scroll_touchpad,
+                                dx,
+                                dy,
+                                0.0,
+                                0.0,
+                                progress,
+                                0,
+                                0,
+                                false,
+                            );
+                            self.cancel_notification_center_close(origin, progress);
+                            self.scroll_close.insert(origin, ScrollCloseRoute::Ordinary);
+                            return false;
+                        };
+                        let closeward_delta = if natural_scroll_touchpad { delta_x } else { -delta_x };
+                        progress = (progress + closeward_delta / SCROLL_CLOSE_PROGRESS_PIXELS).clamp(0.0, 1.0);
+                        self.inject_notification_center_close_phase(
+                            origin,
+                            gesture_hops,
+                            GesturePhase::Changed,
+                            progress,
+                        );
+                        self.scroll_close.insert(
+                            origin,
+                            ScrollCloseRoute::Native {
+                                progress,
+                                hops: gesture_hops,
+                                natural_scroll_touchpad,
+                            },
+                        );
+                        true
+                    }
+                    ScrollPhase::Ended => {
+                        let (delta_x, delta_y) = Self::scroll_close_delta(unit, dx, dy).unwrap_or((0.0, 0.0));
+                        self.trace_notification_center_scroll_close(
+                            "native_ended",
+                            "gesture_ended",
+                            source,
+                            unit,
+                            phase,
+                            wheel_steps.is_some(),
+                            natural_scroll_touchpad,
+                            delta_x,
+                            delta_y,
+                            delta_x,
+                            delta_y,
+                            progress,
+                            0,
+                            0,
+                            true,
+                        );
+                        self.inject_notification_center_close_phase(
+                            origin,
+                            gesture_hops,
+                            GesturePhase::Ended,
+                            progress,
+                        );
+                        self.scroll_close_suppressed_momentum.insert(origin);
+                        true
+                    }
+                    ScrollPhase::Cancelled => {
+                        let (delta_x, delta_y) = Self::scroll_close_delta(unit, dx, dy).unwrap_or((0.0, 0.0));
+                        self.trace_notification_center_scroll_close(
+                            "native_cancelled",
+                            "scroll_cancelled",
+                            source,
+                            unit,
+                            phase,
+                            wheel_steps.is_some(),
+                            natural_scroll_touchpad,
+                            delta_x,
+                            delta_y,
+                            delta_x,
+                            delta_y,
+                            progress,
+                            0,
+                            0,
+                            true,
+                        );
+                        self.inject_notification_center_close_phase(
+                            origin,
+                            gesture_hops,
+                            GesturePhase::Cancelled,
+                            progress,
+                        );
+                        true
+                    }
+                    ScrollPhase::MomentumBegan | ScrollPhase::Momentum | ScrollPhase::MomentumEnded => {
+                        self.trace_notification_center_scroll_close(
+                            "native_interrupted",
+                            "momentum_interrupted",
+                            source,
+                            unit,
+                            phase,
+                            wheel_steps.is_some(),
+                            natural_scroll_touchpad,
+                            dx,
+                            dy,
+                            0.0,
+                            0.0,
+                            progress,
+                            0,
+                            0,
+                            false,
+                        );
+                        self.cancel_notification_center_close(origin, progress);
+                        if phase != ScrollPhase::MomentumEnded {
+                            self.scroll_close_suppressed_momentum.insert(origin);
+                        }
+                        true
+                    }
+                    ScrollPhase::None | ScrollPhase::Began => unreachable!("handled above"),
+                },
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // Scroll fields plus the original source identity.
@@ -3691,6 +4674,14 @@ impl Router {
     /// 释放为某个源按下的所有键和按钮（断线、心跳超时）。
     fn release_origin(&mut self, origin: DeviceId) {
         self.button_diagnostics.release_origin(origin);
+        self.scroll_close_suppressed_momentum.remove(&origin);
+        match self.scroll_close.remove(&origin) {
+            Some(ScrollCloseRoute::Pending { .. }) => {}
+            Some(ScrollCloseRoute::Native { progress, .. }) => {
+                self.cancel_notification_center_close(origin, progress);
+            }
+            Some(ScrollCloseRoute::Ordinary) | None => {}
+        }
         self.multifinger.remove(&origin);
         if self.pending_contacts.origin == Some(origin) {
             self.pending_contacts.clear();
@@ -3724,7 +4715,7 @@ impl Router {
                     phase: GesturePhase::Cancelled,
                     degrees: 0.0,
                 },
-                Gesture::SmartMagnify => Gesture::SmartMagnify,
+                Gesture::SmartMagnify | Gesture::NotificationCenter { .. } => Gesture::SmartMagnify,
             };
             if cancel != Gesture::SmartMagnify {
                 self.out.push(Output::Inject(InjectEvent::Gesture(cancel)));
@@ -3940,6 +4931,7 @@ impl Router {
         if !self.mouse_local() {
             self.cancel_source_scroll();
         }
+        self.cancel_scroll_close_routes();
         self.scroll_fwd.clear();
     }
 
@@ -4771,3 +5763,6 @@ mod target_cursor_sync_tests;
 mod mouse_hotkey_tests;
 
 mod mouse_hotkeys;
+
+#[cfg(test)]
+mod notification_center_tests;

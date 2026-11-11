@@ -81600,6 +81600,101 @@
       "file": "dto-ControlSyncUnlock.hex",
       "kind": "dto",
       "schema": "ControlSyncUnlock"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "4"
+              },
+              "2": {
+                "map": {
+                  "1": {
+                    "uint": "1"
+                  },
+                  "2": {
+                    "uint": "9"
+                  },
+                  "3": {
+                    "uint": "1"
+                  },
+                  "4": {
+                    "uint": "2"
+                  },
+                  "5": {
+                    "f64_bits": "bfd0000000000000"
+                  },
+                  "6": {
+                    "uint": "3196059648"
+                  },
+                  "7": {
+                    "f64_bits": "3fe8000000000000"
+                  },
+                  "8": {
+                    "uint": "1"
+                  },
+                  "9": {
+                    "f64_bits": "400c000000000000"
+                  },
+                  "10": {
+                    "f64_bits": "c012000000000000"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-InputGesture-NotificationCenter-native.hex",
+      "kind": "dto",
+      "schema": "InputGesture"
+    },
+    {
+      "expected": {
+        "map": {
+          "1": {
+            "uint": "1"
+          },
+          "2": {
+            "map": {
+              "1": {
+                "uint": "4"
+              },
+              "2": {
+                "map": {
+                  "1": {
+                    "uint": "2"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "file": "dto-InputGesture-NotificationCenter-phase-only.hex",
+      "kind": "dto",
+      "schema": "InputGesture"
+    },
+    {
+      "expected": {
+        "uint": "4"
+      },
+      "file": "enum-DiagGestureKind-4.hex",
+      "kind": "enum",
+      "schema": "DiagGestureKind"
+    },
+    {
+      "expected": {
+        "uint": "4"
+      },
+      "file": "enum-GestureKind-4.hex",
+      "kind": "enum",
+      "schema": "GestureKind"
     }
   ],
   "frozen": false,
@@ -81612,5 +81707,5 @@
     "reliable_frame": 16384
   },
   "revision": "2026-10-15-ui-freeze",
-  "schema_sha256": "e7e9a49ecf39c11368d785e7e81e5f92f9d78daab6e804fc6d940cae4746346d"
+  "schema_sha256": "182777d498d245cefbad85865a0acb105df85261bc6657572b4925d29bded90f"
 }

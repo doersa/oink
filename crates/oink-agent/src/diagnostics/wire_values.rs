@@ -155,6 +155,10 @@ impl Value for Gesture {
                 dto::<w::DiagRotate>([("phase", phase.wire()?), ("degrees", degrees.wire()?)])?.into_raw(),
             ),
             Self::SmartMagnify => (K::SmartMagnify, RawMap::new()),
+            Self::NotificationCenter { phase, .. } => (
+                K::NotificationCenter,
+                dto::<w::DiagNotificationCenter>([("phase", phase.wire()?)])?.into_raw(),
+            ),
         };
         envelope(kind, body)
     }

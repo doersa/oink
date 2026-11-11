@@ -496,6 +496,7 @@ mod dispatch_tests {
             ControlMsg::InputCapability {
                 controllable: true,
                 touchpad_contacts: None,
+                notification_center_actions: false,
             },
             ControlMsg::LockRemoteWindows(oink_routing::control::WindowsLockRequest {
                 source: boot,

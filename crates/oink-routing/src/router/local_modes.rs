@@ -100,6 +100,11 @@ impl Router {
                 }
                 InjectEvent::Scroll { dx, dy, unit, phase }
             }
+            InputEvent::Gesture(Gesture::NotificationCenter {
+                phase: GesturePhase::Ended,
+                ..
+            }) => InjectEvent::NotificationCenter,
+            InputEvent::Gesture(Gesture::NotificationCenter { .. }) => return Disposition::Swallow,
             InputEvent::Gesture(g) => InjectEvent::Gesture(g),
             _ => return Disposition::Pass,
         };
@@ -148,7 +153,8 @@ impl Router {
                 }
                 (InputEvent::Button { .. }, Output::Inject(InjectEvent::Button { .. }))
                 | (InputEvent::Scroll { .. }, Output::Inject(InjectEvent::Scroll { .. }))
-                | (InputEvent::Gesture(_), Output::Inject(InjectEvent::Gesture(_))) => true,
+                | (InputEvent::Gesture(_), Output::Inject(InjectEvent::Gesture(_)))
+                | (InputEvent::Gesture(_), Output::Inject(InjectEvent::NotificationCenter)) => true,
                 _ => false,
             });
         sink.source_decision(SourceDecision {
@@ -243,6 +249,10 @@ impl Router {
                         degrees: 0.,
                     },
                     Gesture::SmartMagnify => Gesture::SmartMagnify,
+                    Gesture::NotificationCenter { native, .. } => Gesture::NotificationCenter {
+                        phase: GesturePhase::Cancelled,
+                        native: native.map(|fields| fields.with_phase(GesturePhase::Cancelled)),
+                    },
                 };
                 match target {
                     Target::Remote(d) => self.send(
@@ -252,7 +262,9 @@ impl Router {
                             gesture: cancel,
                         }),
                     ),
-                    Target::Local => self.out.push(Output::Inject(InjectEvent::Gesture(cancel))),
+                    Target::Local if !matches!(cancel, Gesture::NotificationCenter { .. }) => {
+                        self.out.push(Output::Inject(InjectEvent::Gesture(cancel)))
+                    }
                     _ => {}
                 }
             }

@@ -523,6 +523,17 @@ impl Injector {
                 result
             }
             InjectEvent::Volume { .. } => unreachable!("volume is ordinary and handled before the injection ledger"),
+            InjectEvent::NotificationCenter => {
+                st.pending_position = None;
+                let submitted = sysevent::post_notification_center_shortcut();
+                if submitted {
+                    self.capture_refresh.key();
+                    Ok(())
+                } else {
+                    let reason = "创建通知中心快捷键事件失败";
+                    Err(InputError::Platform(reason.into()))
+                }
+            }
             InjectEvent::Gesture(g) => {
                 st.pending_position = None;
                 let submitted = sysevent::post_gesture(g);
@@ -561,6 +572,15 @@ impl Injector {
                     }
                 }
                 if submitted {
+                    if matches!(
+                        g,
+                        oink_foundation::input::Gesture::NotificationCenter {
+                            phase: oink_foundation::input::GesturePhase::Began,
+                            ..
+                        }
+                    ) {
+                        self.capture_refresh.key();
+                    }
                     self.gestures.lock().unwrap_or_else(|e| e.into_inner()).record(
                         *g,
                         "inject",

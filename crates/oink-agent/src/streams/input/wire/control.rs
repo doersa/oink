@@ -279,9 +279,11 @@ pub(super) fn encode(value: &ControlMsg) -> v1::Result<Message> {
         ControlMsg::InputCapability {
             controllable,
             touchpad_contacts,
+            notification_center_actions,
         } => Message::InputCapability(w::InputCapability::from_raw(map([
             (1, controllable.write()),
             (2, touchpad_contacts.unwrap_or(0).write()),
+            (3, notification_center_actions.write()),
         ]))?),
     })
 }
@@ -381,6 +383,7 @@ pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
         Message::InputCapability(v) => ControlMsg::InputCapability {
             controllable: v.controllable()?,
             touchpad_contacts: Some(v.max_contacts()?).filter(|count| *count > 0),
+            notification_center_actions: v.notification_center_actions()?,
         },
         _ => return Err(v1::ErrorCode::UnsupportedValue.into()),
     })
@@ -389,6 +392,28 @@ pub(super) fn decode(value: Message) -> v1::Result<ControlMsg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notification_center_capability_is_additive_and_legacy_defaults_off() {
+        let capable = ControlMsg::InputCapability {
+            controllable: true,
+            touchpad_contacts: Some(5),
+            notification_center_actions: true,
+        };
+        assert_eq!(decode(encode(&capable).unwrap()).unwrap(), capable);
+
+        let legacy = Message::InputCapability(
+            w::InputCapability::from_raw(map([(1, true.write()), (2, 0_u8.write())])).unwrap(),
+        );
+        assert_eq!(
+            decode(legacy).unwrap(),
+            ControlMsg::InputCapability {
+                controllable: true,
+                touchpad_contacts: None,
+                notification_center_actions: false,
+            }
+        );
+    }
+
     #[test]
     fn absent_focus_claim_stays_absent_and_session_is_never_fabricated() {
         let state = ControlMsg::FocusState {

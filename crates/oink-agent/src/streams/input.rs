@@ -43,6 +43,8 @@ pub struct ReceiveState {
     /// From `InputCapability`. The router's `sharing` flag for the peer.
     pub controllable: Option<bool>,
     pub touchpad_contacts: Option<u8>,
+    /// Missing on older peers, so additive gesture semantics stay disabled.
+    pub notification_center_actions: Option<bool>,
     pub feel: Option<FeelProfile>,
     /// Newest `ControlMsg::FocusState` (carries the peer's router instance).
     pub focus: Option<ControlMsg>,
@@ -86,9 +88,11 @@ impl ReceiveState {
             Message::Control(ControlMsg::InputCapability {
                 controllable,
                 touchpad_contacts,
+                notification_center_actions,
             }) => {
                 self.controllable = Some(*controllable);
                 self.touchpad_contacts = *touchpad_contacts;
+                self.notification_center_actions = Some(*notification_center_actions);
             }
             Message::Control(ControlMsg::Feel { profile }) => self.feel = Some(profile.clone()),
             Message::Control(m @ ControlMsg::FocusState { .. }) => self.focus = Some(m.clone()),
@@ -176,6 +180,10 @@ impl RouterAdapter for Adapter {
                 .contains(oink_routing::control::WINDOWS_LOCK_CAPABILITY),
         );
         self.router.set_peer_touchpad_contacts(peer, state.touchpad_contacts);
+        self.router.set_peer_notification_center_actions(
+            peer,
+            state.notification_center_actions == Some(true) && peer_os == oink_routing::Os::MacOS,
+        );
         self.router
             .set_peer_scroll_pixels(peer, admission.agreement.contains("oink.input.scroll-pixels/1"));
         self.router
@@ -862,7 +870,8 @@ mod tests {
             messages[0],
             Message::Control(ControlMsg::InputCapability {
                 controllable: false,
-                touchpad_contacts: None
+                touchpad_contacts: None,
+                notification_center_actions: true
             })
         ));
         assert!(matches!(messages[1], Message::Control(ControlMsg::Feel { .. })));

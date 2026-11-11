@@ -13,9 +13,16 @@ struct Active {
     frames: u64,
 }
 
+const RAW_EVENT_LIMIT_PER_SECOND: u8 = 32;
+const RAW_BOUNDARY_LIMIT_PER_SECOND: u8 = 8;
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct Tracker {
-    active: [Option<Active>; 5],
+    active: [Option<Active>; 6],
+    raw_window: Option<u64>,
+    raw_emitted: u8,
+    raw_boundaries: u8,
+    raw_suppressed: u64,
 }
 
 fn slot(g: Gesture) -> Option<usize> {
@@ -33,11 +40,37 @@ fn slot(g: Gesture) -> Option<usize> {
         } => 2,
         Gesture::Magnify { .. } => 3,
         Gesture::Rotate { .. } => 4,
+        Gesture::NotificationCenter { .. } => 5,
         Gesture::SmartMagnify => return None,
     })
 }
 
 impl Tracker {
+    /// Sample at most 32 ordinary and 8 lifecycle-boundary raw events per
+    /// monotonic second. Returns omissions since the previous emitted sample.
+    pub(super) fn sample_raw_tap(&mut self, at_us: u64, boundary: bool) -> Option<u64> {
+        let window = at_us / 1_000_000;
+        if self.raw_window != Some(window) {
+            self.raw_window = Some(window);
+            self.raw_emitted = 0;
+            self.raw_boundaries = 0;
+        }
+        if boundary {
+            if self.raw_boundaries >= RAW_BOUNDARY_LIMIT_PER_SECOND {
+                self.raw_suppressed = self.raw_suppressed.saturating_add(1);
+                return None;
+            }
+            self.raw_boundaries += 1;
+        } else {
+            if self.raw_emitted >= RAW_EVENT_LIMIT_PER_SECOND {
+                self.raw_suppressed = self.raw_suppressed.saturating_add(1);
+                return None;
+            }
+            self.raw_emitted += 1;
+        }
+        Some(std::mem::take(&mut self.raw_suppressed))
+    }
+
     pub(super) fn record(&mut self, gesture: Gesture, owner: &'static str, timestamp_ns: u64) {
         let Some(slot) = slot(gesture) else {
             tracing::debug!(?gesture, owner, timestamp_ns, "gesture lifecycle: instantaneous");
@@ -104,6 +137,22 @@ mod tests {
             velocity: 0.0,
         }
     }
+    #[test]
+    fn raw_tap_samples_are_bounded_and_report_omissions() {
+        let mut t = Tracker::default();
+        for i in 0..u64::from(RAW_EVENT_LIMIT_PER_SECOND) {
+            assert_eq!(t.sample_raw_tap(1_000_000 + i, false), Some(0));
+        }
+        assert_eq!(t.sample_raw_tap(1_000_100, false), None);
+        assert_eq!(t.sample_raw_tap(1_000_200, false), None);
+        assert_eq!(t.sample_raw_tap(2_000_000, false), Some(2));
+        assert_eq!(t.sample_raw_tap(2_000_001, false), Some(0));
+        for i in 0..u64::from(RAW_BOUNDARY_LIMIT_PER_SECOND) {
+            assert_eq!(t.sample_raw_tap(2_000_100 + i, true), Some(0));
+        }
+        assert_eq!(t.sample_raw_tap(2_000_200, true), None);
+    }
+
     #[test]
     fn ownership_change_remains_visible_until_the_sequence_ends() {
         let mut t = Tracker::default();

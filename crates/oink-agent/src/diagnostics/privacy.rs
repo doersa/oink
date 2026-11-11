@@ -198,6 +198,10 @@ impl SafeInput {
                 diagnostic: KeyDiagnostic::default(),
             },
             InjectEvent::Gesture(g) => Self::Gesture(g),
+            InjectEvent::NotificationCenter => Self::Gesture(Gesture::NotificationCenter {
+                phase: oink_foundation::input::GesturePhase::Ended,
+                native: None,
+            }),
         }
     }
 }
